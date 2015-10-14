@@ -212,12 +212,11 @@ write_kvs(Ems, KVs) ->
     % Write the list of KV's to disk in sorted order in chunks
     % of 100. Also make sure that the order is so that they
     % can be streamed in asscending order.
-    {LastKVs, LastPos} =
-    lists:foldr(fun(KV, Acc) ->
+    LastChain = lists:foldr(fun(KV, Acc) ->
         append_item(Ems, Acc, KV, Ems#ems.chain_chunk)
     end, {[], nil}, lists:sort(KVs)),
-    {ok, Final, _} = couch_file:append_term(Ems#ems.fd, {LastKVs, LastPos}),
-    Final.
+    {ok, Ptr} = couch_ngen_file:append_term(Ems#ems.fd, LastChain),
+    Ptr.
 
 
 decimate(#ems{root={_BB, nil}}=Ems) ->
@@ -251,7 +250,7 @@ merge_back_bone(Ems, Choose, BB, NextBB) ->
 merge_rest_back_bone(_Ems, _Choose, nil, Acc) ->
     Acc;
 merge_rest_back_bone(Ems, Choose, BBPos, Acc) ->
-    {ok, {BB, NextBB}} = couch_file:pread_term(Ems#ems.fd, BBPos),
+    {ok, {BB, NextBB}} = couch_ngen_file:read_term(Ems#ems.fd, BBPos),
     NewPos = merge_chains(Ems, Choose, BB),
     {NewBB, NewPrev} = append_item(Ems, Acc, NewPos, Ems#ems.bb_chunk),
     merge_rest_back_bone(Ems, Choose, NextBB, {NewBB, NewPrev}).
@@ -263,8 +262,8 @@ merge_chains(Ems, Choose, BB) ->
 
 
 merge_chains(Ems, _Choose, [], ChainAcc) ->
-    {ok, CPos, _} = couch_file:append_term(Ems#ems.fd, ChainAcc),
-    CPos;
+    {ok, Ptr} = couch_ngen_file:append_term(Ems#ems.fd, ChainAcc),
+    Ptr;
 merge_chains(#ems{chain_chunk=CC}=Ems, Choose, Chains, Acc) ->
     {KV, RestChains} = choose_kv(Choose, Ems, Chains),
     {NewKVs, NewPrev} = append_item(Ems, Acc, KV, CC),
@@ -272,8 +271,8 @@ merge_chains(#ems{chain_chunk=CC}=Ems, Choose, Chains, Acc) ->
 
 
 init_chains(Ems, Choose, BB) ->
-    Chains = lists:map(fun(CPos) ->
-        {ok, {KVs, NextKVs}} = couch_file:pread_term(Ems#ems.fd, CPos),
+    Chains = lists:map(fun(Ptr) ->
+        {ok, {KVs, NextKVs}} = couch_ngen_file:read_term(Ems#ems.fd, Ptr),
         {KVs, NextKVs}
     end, BB),
     order_chains(Choose, Chains).
@@ -285,8 +284,8 @@ order_chains(big, Chains) -> lists:reverse(lists:sort(Chains)).
 
 choose_kv(_Choose, _Ems, [{[KV], nil} | Rest]) ->
     {KV, Rest};
-choose_kv(Choose, Ems, [{[KV], Pos} | RestChains]) ->
-    {ok, Chain} = couch_file:pread_term(Ems#ems.fd, Pos),
+choose_kv(Choose, Ems, [{[KV], Ptr} | RestChains]) ->
+    {ok, Chain} = couch_ngen_file:pread_term(Ems#ems.fd, Ptr),
     case Choose of
         small -> {KV, ins_small_chain(RestChains, Chain, [])};
         big -> {KV, ins_big_chain(RestChains, Chain, [])}
@@ -311,7 +310,7 @@ ins_big_chain(Rest, Chain, Acc) ->
 
 
 append_item(Ems, {List, Prev}, Pos, Size) when length(List) >= Size ->
-    {ok, PrevList, _} = couch_file:append_term(Ems#ems.fd, {List, Prev}),
+    {ok, PrevList} = couch_ngen_file:append_term(Ems#ems.fd, {List, Prev}),
     {[Pos], PrevList};
 append_item(_Ems, {List, Prev}, Pos, _Size) ->
     {[Pos | List], Prev}.

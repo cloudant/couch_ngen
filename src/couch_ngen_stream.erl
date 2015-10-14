@@ -10,7 +10,7 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
--module(couch_ldb_engine_stream).
+-module(couch_ngen_stream).
 
 -export([
     foldl/3,

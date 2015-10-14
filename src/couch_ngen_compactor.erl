@@ -18,13 +18,8 @@
     src_st,
     tgt_st,
     idsort_fd,
-    idsort,
-    cp_path,
-    idx_path,
-    data_path,
-    idsort_path
+    idsort
 }).
-
 
 -record(cacc, {
     batch = [],
@@ -36,8 +31,7 @@
     commit_after = 5242880
 }).
 
-
--record(merge_st, {
+-record(copy_st, {
     id_tree,
     seq_tree,
     curr,
@@ -50,23 +44,24 @@ start(#st{} = St, DbName, Options, Parent) ->
     erlang:put(io_priority, {db_compact, DbName}),
     couch_log:debug("Compaction process spawned for db \"~s\"", [DbName]),
 
-    {ok, CmpSt} = init_compaction(St, Options),
+    {ok, CompSt} = init_compaction(St, Options),
+
+    add_compact_task(CompSt, DbName),
 
     Stages = [
         fun copy_purge_info/1,
         fun copy_compact/1,
-        fun sort_meta_data/1,
-        fun commit_compaction_data/1,
-        fun copy_meta_data/1,
-        fun commit_data/1,
-        fun close_cmp_st/1
+        fun sort_docids/1,
+        fun copy_docids/1,
+        fun final_commit/1,
+        fun close_comp_st/1
     ],
 
-    lists:foldl(fun(Fun, CmpStAcc) ->
-        Fun(CmpStAcc)
-    end, CmpSt, Stages),
-    
-    gen_server:cast(Parent, {compact_done, couch_ngen, DName}).
+    ok = lists:foldl(fun(Fun, CompStAcc) ->
+        Fun(CompStAcc)
+    end, CompSt, Stages),
+
+    gen_server:cast(Parent, {compact_done, couch_ngen, St#st.dirpath}).
 
 
 init_compaction(SrcSt, Options) ->
@@ -84,38 +79,34 @@ init_compaction(SrcSt, Options) ->
         {error, enoent} ->
             {ok, Fd0} = couch_ngen_file:open(CPPath, [create] ++ Options),
             Fd0;
-        Else ->
-            erlang:error(Else)
+        OpenCPError ->
+            erlang:error(OpenCPError)
     end,
 
-    {IdxPath, DataPath} = couch_ngen:get_file_paths(CPFd, DirPath),
+    {ok, CPFd, IdxFd, DataFd} =
+        couch_ngen:open_idx_data_files(CPFd, DirPath, [compactor | Options]),
 
-    CompactIdxPath = <<IdxPath/binary, ".compact">>,
-    {ok, IdxFd} = couch_ngen_file:open(CompactIdxPath, Options),
-
-    IdSortPath = <<IdxPath/binary, ".compact.ids">>,
+    IdxCompactPath = couch_ngen_file:path(IdxFd),
+    IdSortPath = <<IdxCompactPath/binary, ".ids">>,
     IdSortFd = case couch_ngen_file:open(IdSortPath, Options) of
         {ok, Fd1} ->
             Fd1;
         {error, enoent} ->
             {ok, Fd1} = couch_ngen_file:open(IdSortPath, [create] ++ Options),
             Fd1;
-        Else ->
-            erlang:error(Else)
+        OpenSortError ->
+            erlang:error(OpenSortError)
     end,
-
-    CompactDataPath = <<DataPath/binary, ".compact">>,
-    {ok, DataFd} = couch_ngen_file:open(CompactDataPath, Options),
 
     {TgtHeader, IdSortSt} = case couch_ngen:read_header(CPFd, IdxFd) of
         #comp_header{} = Hdr->
-            {Hdr#comp_header.db_header, Hdr#comp_header.idsort_state}
+            {Hdr#comp_header.db_header, Hdr#comp_header.idsort_state};
         no_valid_header ->
             ok = couch_ngen_file:truncate(IdxFd, 0),
             ok = couch_ngen_file:truncate(IdSortFd, 0),
             ok = couch_ngen_file:truncate(DataFd, 0),
             couch_ngen:write_header(CPFd, IdxFd, TgtHeader0),
-            {NewHeader, undefined};
+            {TgtHeader0, undefined};
         Header0 ->
             true = couch_ngen_header:is_header(Header0),
             ok = couch_ngen_file:truncate(IdSortFd, 0),
@@ -131,347 +122,315 @@ init_compaction(SrcSt, Options) ->
         src_st = SrcSt,
         tgt_st = TgtSt,
         idsort_fd = IdSortFd,
-        idsort = IdSort,
-        cp_path = CPPath,
-        idx_path = IdxPath,
-        data_path = DataPath,
-        idsort_path = IdSortPath
+        idsort = IdSort
     }}.
 
 
-copy_purge_info(CmpSt) ->
+copy_purge_info(CompSt) ->
     #comp_st{
-        old_st = OldSt,
-        new_st = NewSt
+        src_st = SrcSt,
+        tgt_st = TgtSt
     } = CompSt,
-    OldHdr = OldSt#st.header,
-    NewHdr = NewSt#st.header,
-    OldPurgeSeq = couch_ngen_header:purge_seq(OldHdr),
-    case OldPurgeSeq > 0 of
+    SrcHdr = SrcSt#st.header,
+    TgtHdr = TgtSt#st.header,
+    SrcPurgeSeq = couch_ngen_header:purge_seq(SrcHdr),
+    NewTgtSt = case SrcPurgeSeq > 0 of
         true ->
-            Purged = couch_ngen:get(OldSt, last_purged),
-            {ok, Ptr} = couch_ngen_file:append_term(NewSt#st.fd, Purged),
-            NewNewHdr = couch_ngen_header:set(NewHdr, [
-                {purge_seq, OldPurgeSeq},
+            Purged = couch_ngen:get(SrcSt, last_purged),
+            {ok, Ptr} = couch_ngen_file:append_term(TgtSt#st.data_fd, Purged),
+            NewTgtHdr = couch_ngen_header:set(TgtHdr, [
+                {purge_seq, SrcPurgeSeq},
                 {purged_docs, Ptr}
             ]),
-            NewSt#st{header = NewNewHdr};
+            TgtSt#st{header = NewTgtHdr};
         false ->
-            NewSt
-    end.
+            TgtSt
+    end,
+    CompSt#comp_st{
+        tgt_st = NewTgtSt
+    }.
 
 
-copy_compact(CompSt) ->
+copy_compact(CompSt0) ->
     #comp_st{
-        old_st = OldSt,
-        new_st = NewSt1
-    } = CompSt,
+        src_st = SrcSt0,
+        tgt_st = TgtSt0
+    } = CompSt0,
 
-    NewUpdateSeq = couch_ngen:get(NewSt1, update_seq),
+    CompUpdateSeq = couch_ngen:get(TgtSt0, update_seq),
     BufferSize = get_config_int("doc_buffer_size", 524288),
     CheckpointAfter = get_config_int("checkpoint_after", BufferSize * 10),
 
-    {ok, _, {NewCompSt, NewCAcc}} = couch_ngen_btree:foldl(
-            OldSt#st.seq_tree,
+    {ok, _, {CompSt1, NewCAcc}} = couch_ngen_btree:foldl(
+            SrcSt0#st.seq_tree,
             fun enum_by_seq_fun/3,
             #cacc{
                 max_batch = BufferSize,
                 commit_after = CheckpointAfter
             },
-            [{start_key, NewUpdateSeq + 1}]
+            [{start_key, CompUpdateSeq + 1}]
         ),
-
-    #comp_st{
-        new_st = NewSt2
-    } = NewCompSt,
 
     #cacc{
         batch = Uncopied
     } = NewCAcc,
 
-    NewSt3 = copy_docs(OldSt, NewSt2, lists:reverse(Uncopied)),
+    CompSt2 = copy_docs(CompSt1, lists:reverse(Uncopied)),
+
+    #comp_st{
+        src_st = SrcSt1,
+        tgt_st = TgtSt1
+    } = CompSt2,
 
     % Copy the security information over
-    {ok, NewSt4} = case couch_ngen:get(St, security) of
+    {ok, TgtSt2} = case couch_ngen:get(SrcSt1, security) of
         [] ->
-            couch_ngen:set(NewSt3, security_ptr, nil);
-        SecProps ->
-            {ok, Ptr} = couch_file:append_term(NewSt3#st.data_fd, SecProps),
-            couch_ngen:set(NewSt3, security_ptr, Ptr)
+            couch_ngen:set(TgtSt1, security_ptr, nil);
+        SecObj ->
+            {ok, Ptr} = couch_ngen_file:append_term(TgtSt1#st.data_fd, SecObj),
+            couch_ngen:set(TgtSt1, security_ptr, Ptr)
     end,
 
-    FinalUpdateSeq = couch_ngen:get(OldSt, update_seq),
-    {ok, NewSt5} = couch_ngen:set(NewSt4, update_seq, FinalUpdateSeq),
-    commit_compaction_data(NewSt5).
+    FinalUpdateSeq = couch_ngen:get(SrcSt1, update_seq),
+    {ok, TgtSt3} = couch_ngen:set(TgtSt2, update_seq, FinalUpdateSeq),
+
+    commit_compaction_data(CompSt2#comp_st{tgt_st = TgtSt3}).
 
 
-enum_docs_fun(FDI, _Offset, {CompSt, CAcc}) ->
+enum_by_seq_fun(FDI, _Offset, {CompSt0, CAcc}) ->
     #comp_st{
-        old_st = OldSt,
-        new_st = NewSt
-    } = CompSt,
+        tgt_st = TgtSt0
+    } = CompSt0,
 
     Seq = FDI#full_doc_info.update_seq,
     NewBatch = [FDI | CAcc#cacc.batch],
-    CurrBatchSize = CAcc#cacc.curr_batch + ?term_size(DocInfo),
+    CurrBatchSize = CAcc#cacc.curr_batch + ?term_size(FDI),
 
     AccOut = case CurrBatchSize >= CAcc#cacc.max_batch of
         true ->
-            NewSt1 = copy_docs(OldSt, NewSt, NewBatch),
-            {ok, NewSt2} = couch_ngen:set(NewSt1, update_seq, Seq),
+            CompSt1 = copy_docs(CompSt0, NewBatch),
+            {ok, TgtSt1} = couch_ngen:set(TgtSt0, update_seq, Seq),
+            CompSt2 = CompSt1#comp_st{tgt_st = TgtSt1},
             NewCAcc1 = CAcc#cacc{batch = [], curr_batch = 0},
 
             SinceCommit = CAcc#cacc.since_commit + CurrBatchSize,
             case SinceCommit >= CAcc#cacc.commit_after of
                 true ->
-                    NewSt3 = commit_compaction_data(NewSt2),
-                    NewCompSt = CompSt#comp_st{new_st = NewSt3},
                     NewCAcc2 = CAcc#cacc{since_commit = 0},
-                    {NewCompSt, NewCAcc2};
+                    {commit_compaction_data(CompSt2), NewCAcc2};
                 false ->
-                    NewCompSt = CompSt#comp_st{new_st = NewSt2},
-                    {NewCompSt, NewCAcc1}
+                    {CompSt2, NewCAcc1}
             end;
         false ->
-            {CompSt, CAcc#cacc{batch = NewBatch, curr_batch = CurrBatchSize}}
+            {CompSt0, CAcc#cacc{batch = NewBatch, curr_batch = CurrBatchSize}}
     end,
     {ok, AccOut}.
 
 
-copy_docs(OldSt, NewSt, FDIs) ->
+copy_docs(CompSt, FDIs) ->
+    #comp_st{
+        tgt_st = TgtSt,
+        idsort = IdSort
+    } = CompSt,
+
     % COUCHDB-968, make sure we prune duplicates during compaction
     NewInfos0 = lists:usort(fun(#full_doc_info{id=A}, #full_doc_info{id=B}) ->
         A =< B
     end, FDIs),
 
-    NewInfos1 = lists:map(fun(Info) ->
-        {NewRevTree, FinalAcc} = couch_key_tree:mapfold(fun
-            (_Rev, #leaf{ptr=Sp}=Leaf, leaf, SizesAcc) ->
-                {Body, AttInfos} = copy_doc_attachments(St, Sp, NewSt),
-                SummaryChunk = couch_bt_engine:make_doc_summary(
-                        NewSt, {Body, AttInfos}),
-                ExternalSize = ?term_size(SummaryChunk),
-                {ok, Pos, SummarySize} = couch_file:append_raw_chunk(
-                    NewSt#st.fd, SummaryChunk),
-                AttSizes = [{element(3,A), element(4,A)} || A <- AttInfos],
-                NewLeaf = Leaf#leaf{
-                    ptr = Pos,
-                    sizes = #size_info{
-                        active = SummarySize,
-                        external = ExternalSize
-                    },
-                    atts = AttSizes
-                },
-                {NewLeaf, couch_db_updater:add_sizes(leaf, NewLeaf, SizesAcc)};
-            (_Rev, _Leaf, branch, SizesAcc) ->
-                {?REV_MISSING, SizesAcc}
-        end, {0, 0, []}, Info#full_doc_info.rev_tree),
-        {FinalAS, FinalES, FinalAtts} = FinalAcc,
-        TotalAttSize = lists:foldl(fun({_, S}, A) -> S + A end, 0, FinalAtts),
-        NewActiveSize = FinalAS + TotalAttSize,
-        NewExternalSize = FinalES + TotalAttSize,
-        Info#full_doc_info{
-            rev_tree = NewRevTree,
-            sizes = #size_info{
-                active = NewActiveSize,
-                external = NewExternalSize
-            }
-        }
+    Limit = couch_ngen:get(TgtSt, revs_limit),
+
+    DocIdPtrs = lists:map(fun(Info) ->
+        copy_doc(CompSt, Info, Limit)
     end, NewInfos0),
 
-    Limit = couch_bt_engine:get(St, revs_limit),
-    NewInfos = lists:map(fun(FDI) ->
-        FDI#full_doc_info{
-            rev_tree = couch_key_tree:stem(FDI#full_doc_info.rev_tree, Limit)
+    % If compaction is being rerun to catch up to writes during
+    % the first pass we may have docs that already exist
+    % in the seq_tree. Here we lookup any old update_seqs so
+    % that they can be removed.
+
+    DocIds = [Id || {Id, _Ptr} <- DocIdPtrs],
+    Existing = couch_btree:lookup(TgtSt#st.id_tree, DocIds),
+    RemSeqs = [Seq || {ok, #full_doc_info{update_seq=Seq}} <- Existing],
+
+    {ok, SeqTree} = couch_btree:add_remove(
+            TgtSt#st.seq_tree, DocIdPtrs, RemSeqs),
+
+    IdSortPtrs = lists:zipwith(fun(FDI, {DocId, Ptr}) ->
+        {{DocId, FDI#full_doc_info.update_seq}, Ptr}
+    end, NewInfos0, DocIdPtrs),
+
+    {ok, NewIdSort} = couch_emsort:add(IdSort, IdSortPtrs),
+
+    update_compact_task(length(DocIdPtrs)),
+
+    CompSt#comp_st{
+        tgt_st = TgtSt#st{
+            seq_tree = SeqTree
+        },
+        idsort = NewIdSort
+    }.
+
+
+copy_doc(CompSt, FDI, Limit) ->
+    #comp_st{
+        tgt_st = TgtSt
+    } = CompSt,
+
+    InitAcc = {CompSt, {0, 0, []}},
+    RevTree = FDI#full_doc_info.rev_tree,
+
+    {NewRevTree, AccOut}
+            = couch_key_tree:mapfold(fun copy_leaves/4, InitAcc, RevTree),
+
+    {_, {FinalAS, FinalES, FinalAtts}} = AccOut,
+    TotalAttSize = lists:foldl(fun({_, S}, A) -> S + A end, 0, FinalAtts),
+    NewActiveSize = FinalAS + TotalAttSize,
+    NewExternalSize = FinalES + TotalAttSize,
+
+    NewFDI  = FDI#full_doc_info{
+        rev_tree = couch_key_tree:stem(NewRevTree, Limit),
+        sizes = #size_info{
+            active = NewActiveSize,
+            external = NewExternalSize
         }
-    end, NewInfos1),
+    },
 
-    RemoveSeqs =
-    case Retry of
-    nil ->
-        [];
-    OldDocIdTree ->
-        % Compaction is being rerun to catch up to writes during the
-        % first pass. This means we may have docs that already exist
-        % in the seq_tree in the .data file. Here we lookup any old
-        % update_seqs so that they can be removed.
-        Ids = [Id || #full_doc_info{id=Id} <- NewInfos],
-        Existing = couch_btree:lookup(OldDocIdTree, Ids),
-        [Seq || {ok, #full_doc_info{update_seq=Seq}} <- Existing]
+    couch_ngen:write_doc_info(TgtSt, NewFDI).
+
+
+copy_leaves(_Rev, _Leaf, branch, Acc) ->
+    {?REV_MISSING, Acc};
+
+copy_leaves(_Rev, #leaf{}, Leaf, {CompSt, SizesAcc}) ->
+    #comp_st{
+        src_st = SrcSt,
+        tgt_st = TgtSt
+    } = CompSt,
+    #leaf{
+        ptr = Ptr
+    } = Leaf,
+
+    {Body, Atts} = copy_doc_attachments(SrcSt, TgtSt, Ptr),
+    AttInfos = [couch_att:to_disk_term(A) || A <- Atts],
+    DocBin = couch_bt_engine:make_doc_summary(TgtSt, {Body, AttInfos}),
+
+    HashOpts = [{hash, sha256}],
+    {ok, Ptr} = couch_ngen_file:write_bin(TgtSt#st.data_fd, DocBin, HashOpts),
+
+    AttSizeFun = fun(Att) ->
+        [{_, Sp}, Size] = couch_att:fetch([data, att_len], Att),
+        {Sp, Size}
     end,
 
-    {ok, SeqTree} = couch_btree:add_remove(
-            NewSt#st.seq_tree, NewInfos, RemoveSeqs),
+    NewLeaf = Leaf#leaf{
+        ptr = Ptr,
+        sizes = #size_info{
+            active = couch_ngen_file:length(Ptr),
+            external = ?term_size(Body)
+        },
+        atts = lists:map(AttSizeFun, Atts)
+    },
+    {NewLeaf, couch_db_updater:add_sizes(leaf, NewLeaf, SizesAcc)}.
 
-    FDIKVs = lists:map(fun(#full_doc_info{id=Id, update_seq=Seq}=FDI) ->
-        {{Id, Seq}, FDI}
-    end, NewInfos),
-    {ok, IdEms} = couch_emsort:add(NewSt#st.id_tree, FDIKVs),
-    update_compact_task(length(NewInfos)),
-    NewSt#st{id_tree=IdEms, seq_tree=SeqTree}.
 
+copy_doc_attachments(SrcSt, TgtSt, DocPtr) ->
+    {ok, {Body, AttInfos}} = couch_ngen:read_doc(SrcSt, DocPtr),
 
-copy_doc_attachments(#st{} = SrcSt, SrcSp, DstSt) ->
-    {ok, {BodyData, BinInfos0}} = couch_bt_engine:read_doc(SrcSt, SrcSp),
-    BinInfos = case BinInfos0 of
-    _ when is_binary(BinInfos0) ->
-        couch_compress:decompress(BinInfos0);
-    _ when is_list(BinInfos0) ->
-        % pre 1.2 file format
-        BinInfos0
+    StreamFun = fun(Sp) -> couch_ngen:open_read_stream(SrcSt, Sp) end,
+    LoadFun = fun(Info) -> couch_att:from_disk_term(StreamFun, Info) end,
+    Atts = lists:map(LoadFun, AttInfos),
+
+    CopyFun = fun(Att) ->
+        Dst = couch_ngen:open_write_stream(TgtSt, []),
+        couch_att:copy(Att, Dst)
     end,
-    % copy the bin values
-    NewBinInfos = lists:map(
-        fun({Name, Type, BinSp, AttLen, RevPos, ExpectedMd5}) ->
-            % 010 UPGRADE CODE
-            SrcStream = couch_bt_engine:open_read_stream(SrcSt, BinSp),
-            DstStream = couch_bt_engine:open_write_stream(DstSt, []),
-            ok = couch_stream:copy(SrcStream, DstStream),
-            {NewStream, AttLen, AttLen, ActualMd5, _IdentityMd5} =
-                couch_stream:close(DstStream),
-            NewBinSp = couch_stream:to_disk_term(NewStream),
-            couch_util:check_md5(ExpectedMd5, ActualMd5),
-            {Name, Type, NewBinSp, AttLen, AttLen, RevPos, ExpectedMd5, identity};
-        ({Name, Type, BinSp, AttLen, DiskLen, RevPos, ExpectedMd5, Enc1}) ->
-            SrcStream = couch_bt_engine:open_read_stream(SrcSt, BinSp),
-            DstStream = couch_bt_engine:open_write_stream(DstSt, []),
-            ok = couch_stream:copy(SrcStream, DstStream),
-            {NewStream, AttLen, _, ActualMd5, _IdentityMd5} =
-                couch_stream:close(DstStream),
-            NewBinSp = couch_stream:to_disk_term(NewStream),
-            couch_util:check_md5(ExpectedMd5, ActualMd5),
-            Enc = case Enc1 of
-            true ->
-                % 0110 UPGRADE CODE
-                gzip;
-            false ->
-                % 0110 UPGRADE CODE
-                identity;
-            _ ->
-                Enc1
-            end,
-            {Name, Type, NewBinSp, AttLen, DiskLen, RevPos, ExpectedMd5, Enc}
-        end, BinInfos),
-    {BodyData, NewBinInfos}.
+    CopiedAtts = lists:map(CopyFun, Atts),
+
+    {Body, CopiedAtts}.
 
 
-sort_meta_data(St0) ->
-    {ok, Ems} = couch_emsort:merge(St0#st.id_tree),
-    St0#st{id_tree=Ems}.
+sort_docids(CompSt) ->
+    #comp_st{
+        idsort = IdSort
+    } = CompSt,
+    {ok, NewIdSort} = couch_emsort:merge(IdSort),
+
+    % Need to fsync and write a header at this point
+
+    CompSt#comp_st{
+        idsort = NewIdSort
+    }.
 
 
-copy_meta_data(#st{} = St) ->
+copy_docids(CompSt) ->
+    #comp_st{
+        tgt_st = TgtSt,
+        idsort = IdSort
+    } = CompSt,
     #st{
-        fd = Fd,
-        header = Header,
-        id_tree = Src
-    } = St,
-    DstState = couch_bt_engine_header:id_tree_state(Header),
-    {ok, IdTree0} = couch_btree:open(DstState, Fd, [
-        {split, fun couch_bt_engine:id_tree_split/1},
-        {join, fun couch_bt_engine:id_tree_join/2},
-        {reduce, fun couch_bt_engine:id_tree_reduce/2}
-    ]),
-    {ok, Iter} = couch_emsort:iter(Src),
-    Acc0 = #merge_st{
-        id_tree=IdTree0,
-        seq_tree=St#st.seq_tree,
-        rem_seqs=[],
-        infos=[]
+        id_tree = IdTree,
+        seq_tree = SeqTree
+    } = TgtSt,
+
+    {ok, Iter} = couch_emsort:iter(IdSort),
+
+    AccIn = #copy_st{
+        id_tree = IdTree,
+        seq_tree = SeqTree,
+        rem_seqs = [],
+        infos = []
     },
-    Acc = merge_docids(Iter, Acc0),
-    {ok, IdTree} = couch_btree:add(Acc#merge_st.id_tree, Acc#merge_st.infos),
-    {ok, SeqTree} = couch_btree:add_remove(
-        Acc#merge_st.seq_tree, [], Acc#merge_st.rem_seqs
-    ),
-    St#st{id_tree=IdTree, seq_tree=SeqTree}.
+
+    AccOut = merge_docids(Iter, AccIn),
+
+    #copy_st{
+        id_tree = NewIdTree,
+        seq_tree = NewSeqTree,
+        rem_seqs = RemSeqsOut,
+        infos = InfosOut
+    } = AccOut,
+
+    {ok, FinalIdTree} = couch_ngen_btree:add(NewIdTree, InfosOut),
+    {ok, FinalSeqTree} = couch_btree:add_remove(NewSeqTree, [], RemSeqsOut),
+
+    CompSt#comp_st{
+        tgt_st = TgtSt#st{
+            id_tree = FinalIdTree,
+            seq_tree = FinalSeqTree
+        }
+    }.
 
 
-open_compaction_file(FilePath, Opts) ->
-    case couch_ngen_file:open(FilePath, Opts) of
-        {error, enoent} ->
-            couch_ngen_file:open(FilePath, [create] ++ Opts);
-        Else ->
-            Else
-    end.
-
-
-reset_compaction_file(Fd, Header) ->
-    ok = couch_file:truncate(Fd, 0),
-    ok = couch_file:write_header(Fd, Header).
-
-
-commit_compaction_data(#st{}=St) ->
-    % Compaction needs to write headers to both the data file
-    % and the meta file so if we need to restart we can pick
-    % back up from where we left off.
-    commit_compaction_data(St, couch_emsort:get_fd(St#st.id_tree)),
-    commit_compaction_data(St, St#st.fd).
-
-
-commit_compaction_data(#st{header = OldHeader} = St0, Fd) ->
-    DataState = couch_bt_engine_header:id_tree_state(OldHeader),
-    MetaFd = couch_emsort:get_fd(St0#st.id_tree),
-    MetaState = couch_emsort:get_state(St0#st.id_tree),
-    St1 = bind_id_tree(St0, St0#st.fd, DataState),
-    Header = St1#st.header,
-    CompHeader = #comp_header{
-        db_header = Header,
-        meta_state = MetaState
-    },
-    ok = couch_file:sync(Fd),
-    ok = couch_file:write_header(Fd, CompHeader),
-    St2 = St1#st{
-        header = Header
-    },
-    bind_emsort(St2, MetaFd, MetaState).
-
-
-bind_emsort(St, Fd, nil) ->
-    {ok, Ems} = couch_emsort:open(Fd),
-    St#st{id_tree=Ems};
-bind_emsort(St, Fd, State) ->
-    {ok, Ems} = couch_emsort:open(Fd, [{root, State}]),
-    St#st{id_tree=Ems}.
-
-
-bind_id_tree(St, Fd, State) ->
-    {ok, IdBtree} = couch_btree:open(State, Fd, [
-        {split, fun couch_bt_engine:id_tree_split/1},
-        {join, fun couch_bt_engine:id_tree_join/2},
-        {reduce, fun couch_bt_engine:id_tree_reduce/2}
-    ]),
-    St#st{id_tree=IdBtree}.
-
-
-merge_docids(Iter, #merge_st{infos=Infos}=Acc) when length(Infos) > 1000 ->
-    #merge_st{
-        id_tree=IdTree0,
-        seq_tree=SeqTree0,
-        rem_seqs=RemSeqs
+merge_docids(Iter, #copy_st{infos = Infos} = Acc) when length(Infos) > 1000 ->
+    #copy_st{
+        id_tree = IdTree0,
+        seq_tree = SeqTree0,
+        rem_seqs = RemSeqs
     } = Acc,
     {ok, IdTree1} = couch_btree:add(IdTree0, Infos),
     {ok, SeqTree1} = couch_btree:add_remove(SeqTree0, [], RemSeqs),
-    Acc1 = Acc#merge_st{
-        id_tree=IdTree1,
-        seq_tree=SeqTree1,
-        rem_seqs=[],
-        infos=[]
+    Acc1 = Acc#copy_st{
+        id_tree = IdTree1,
+        seq_tree = SeqTree1,
+        rem_seqs = [],
+        infos = []
     },
     merge_docids(Iter, Acc1);
-merge_docids(Iter, #merge_st{curr=Curr}=Acc) ->
+
+merge_docids(Iter, #copy_st{curr = Curr} = Acc) ->
     case next_info(Iter, Curr, []) of
-        {NextIter, NewCurr, FDI, Seqs} ->
-            Acc1 = Acc#merge_st{
-                infos = [FDI | Acc#merge_st.infos],
-                rem_seqs = Seqs ++ Acc#merge_st.rem_seqs,
+        {NextIter, NewCurr, DocIdPtr, Seqs} ->
+            Acc1 = Acc#copy_st{
+                infos = [DocIdPtr | Acc#copy_st.infos],
+                rem_seqs = Seqs ++ Acc#copy_st.rem_seqs,
                 curr = NewCurr
             },
             merge_docids(NextIter, Acc1);
-        {finished, FDI, Seqs} ->
-            Acc#merge_st{
-                infos = [FDI | Acc#merge_st.infos],
-                rem_seqs = Seqs ++ Acc#merge_st.rem_seqs,
+        {finished, DocIdPtr, Seqs} ->
+            Acc#copy_st{
+                infos = [DocIdPtr | Acc#copy_st.infos],
+                rem_seqs = Seqs ++ Acc#copy_st.rem_seqs,
                 curr = undefined
             };
         empty ->
@@ -481,33 +440,101 @@ merge_docids(Iter, #merge_st{curr=Curr}=Acc) ->
 
 next_info(Iter, undefined, []) ->
     case couch_emsort:next(Iter) of
-        {ok, {{Id, Seq}, FDI}, NextIter} ->
-            next_info(NextIter, {Id, Seq, FDI}, []);
+        {ok, {{Id, Seq}, Ptr}, NextIter} ->
+            next_info(NextIter, {Id, Seq, Ptr}, []);
         finished ->
             empty
     end;
-next_info(Iter, {Id, Seq, FDI}, Seqs) ->
+
+next_info(Iter, {Id, Seq, Ptr}, Seqs) ->
     case couch_emsort:next(Iter) of
-        {ok, {{Id, NSeq}, NFDI}, NextIter} ->
-            next_info(NextIter, {Id, NSeq, NFDI}, [Seq | Seqs]);
-        {ok, {{NId, NSeq}, NFDI}, NextIter} ->
-            {NextIter, {NId, NSeq, NFDI}, FDI, Seqs};
+        {ok, {{Id, NSeq}, NPtr}, NextIter} ->
+            next_info(NextIter, {Id, NSeq, NPtr}, [Seq | Seqs]);
+        {ok, {{NId, NSeq}, NPtr}, NextIter} ->
+            {NextIter, {NId, NSeq, NPtr}, {Id, Ptr}, Seqs};
         finished ->
-            {finished, FDI, Seqs}
+            {finished, {Id, Ptr}, Seqs}
     end.
+
+
+commit_compaction_data(CompSt) ->
+    #comp_st{
+        tgt_st = TgtSt,
+        idsort = IdSort,
+        idsort_fd = IdSortFd
+    } = CompSt,
+
+    Fds = [
+        TgtSt#st.cp_fd,
+        TgtSt#st.idx_fd,
+        TgtSt#st.data_fd,
+        IdSortFd
+    ],
+
+    lists:foreach(fun(Fd) ->
+        couch_ngen_file:sync(Fd)
+    end, Fds),
+
+    TgtHeader = couch_ngen:update_header(TgtSt, TgtSt#st.header),
+    IdSortSt = couch_emsort:get_state(IdSort),
+
+    CompHeader = #comp_header{
+        db_header = TgtHeader,
+        idsort_state = IdSortSt
+    },
+
+    ok = couch_ngen:write_header(TgtSt#st.cp_fd, TgtSt#st.idx_fd, CompHeader),
+    ok = couch_ngen_file:sync(TgtSt#st.idx_fd),
+    ok = couch_ngen_file:sync(TgtSt#st.cp_fd),
+
+    CompSt.
+
+
+final_commit(CompSt) ->
+    #comp_st{
+        tgt_st = TgtSt
+    } = CompSt,
+
+    Fds = [
+        TgtSt#st.cp_fd,
+        TgtSt#st.idx_fd,
+        TgtSt#st.data_fd
+    ],
+
+    lists:foreach(fun(Fd) ->
+        couch_ngen_file:sync(Fd)
+    end, Fds),
+
+    TgtHeader = couch_ngen:update_header(TgtSt, TgtSt#st.header),
+
+    ok = couch_ngen:write_header(TgtSt#st.cp_fd, TgtSt#st.idx_fd, TgtHeader),
+    ok = couch_ngen_file:sync(TgtSt#st.idx_fd),
+    ok = couch_ngen_file:sync(TgtSt#st.cp_fd),
+
+    CompSt.
+
+
+close_comp_st(CompSt) ->
+    #comp_st{
+        tgt_st = TgtSt,
+        idsort_fd = IdSortFd
+    } = CompSt,
+    couch_ngen:decref(TgtSt),
+    couch_ngen_file:close(IdSortFd),
+    ok.
 
 
 get_config_int(Key, Default) ->
     config:get_integer("database_compaction", Key, Default).
 
 
-add_compact_task(CompSt) ->
+add_compact_task(CompSt, DbName) ->
     #comp_st{
-        old_st = OldSt,
-        new_st = NewSt
+        src_st = SrcSt,
+        tgt_st = TgtSt
     } = CompSt,
-    NewUpdateSeq = couch_ngen:get(NewSt, update_seq),
-    TotalChanges = couch_ngen:count_changes_since(OldSt, NewUpdateSeq),
+    NewUpdateSeq = couch_ngen:get(TgtSt, update_seq),
+    TotalChanges = couch_ngen:count_changes_since(SrcSt, NewUpdateSeq),
     TaskProps0 = [
         {type, database_compaction},
         {database, DbName},
@@ -515,7 +542,7 @@ add_compact_task(CompSt) ->
         {changes_done, 0},
         {total_changes, TotalChanges}
     ],
-    IsRetry = couch_ngen_btree:get_state(NewSt#st.id_tree) == nil,
+    IsRetry = couch_ngen_btree:get_state(TgtSt#st.id_tree) == nil,
     TaskExists = couch_task_status:is_task_added(),
     case IsRetry of
         true when TaskExists ->
@@ -533,15 +560,10 @@ add_compact_task(CompSt) ->
     couch_task_status:set_update_frequency(500).
 
 
-
 update_compact_task(NumChanges) ->
     [Changes, Total] = couch_task_status:get([changes_done, total_changes]),
     Changes2 = Changes + NumChanges,
-    Progress = case Total of
-    0 ->
-        0;
-    _ ->
+    Progress = if Total == 0 -> 0; true ->
         (Changes2 * 100) div Total
     end,
     couch_task_status:update([{changes_done, Changes2}, {progress, Progress}]).
-

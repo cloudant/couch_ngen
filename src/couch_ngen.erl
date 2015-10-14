@@ -47,28 +47,28 @@
 % These are used by the compactor
 -export([
     init_state/6,
-    get_file_paths/2,
+    open_idx_data_files/3,
     read_header/2,
-    write_header/3
+    write_header/3,
+    update_header/2,
+    write_doc_info/2
 ]).
 
 
 -export([
-    id_tree_split/1,
-    id_tree_join/2,
-    id_tree_reduce/2,
+    id_seq_tree_split/2,
+    id_seq_tree_join/3,
 
-    seq_tree_split/1,
-    seq_tree_join/2,
+    id_tree_reduce/2,
     seq_tree_reduce/2,
 
-    local_tree_split/1,
-    local_tree_join/2
+    local_tree_split/2,
+    local_tree_join/3
 ]).
 
 
 -include_lib("couch/include/couch_db.hrl").
--include("couch_bt_engine.hrl").
+-include("couch_ngen.hrl").
 
 
 exists(DirPath) ->
@@ -76,7 +76,7 @@ exists(DirPath) ->
     filelib:is_dir(CPFile).
 
 
-delete(RootDir, FilePath, Async) ->
+delete(RootDir, DirPath, Async) ->
     %% Delete any leftover compaction files. If we don't do this a
     %% subsequent request for this DB will try to open them to use
     %% as a recovery.
@@ -86,8 +86,9 @@ delete(RootDir, FilePath, Async) ->
 delete_compaction_files(RootDir, DirPath) ->
     nifile:lsdir(DirPath, fun(FName, _) ->
         FNameLen = size(FName),
+        WithoutCompact = FNameLen - 8,
         case FName of
-            <<_:(FNameLen - 8)/binary, ".compact">> ->
+            <<_:WithoutCompact/binary, ".compact">> ->
                 couch_ngen_file:delete(RootDir, FName);
             _ ->
                 ok
@@ -120,7 +121,7 @@ init(DirPath, Options) ->
 terminate(_Reason, St) ->
     lists:foreach(fun(Fd) ->
         catch couch_ngen_file:close(Fd),
-        couch_util:shutdown_sync(St#st.fd)
+        couch_util:shutdown_sync(Fd)
     end, [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]),
     ok.
 
@@ -129,7 +130,7 @@ handle_call(Msg, St) ->
     {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
 
 
-handle_info({'DOWN', Ref, _, _, _}, St) ->
+handle_info({'DOWN', _, _, _, _}, St) ->
     {stop, normal, St}.
 
 
@@ -137,20 +138,20 @@ incref(St) ->
     Monitors = [
         erlang:monitor(process, St#st.idx_fd),
         erlang:monitor(process, St#st.data_fd)
-    ]
+    ],
     {ok, St#st{fd_monitors = Monitors}}.
 
 
 decref(St) ->
     lists:foreach(fun(Ref) ->
-        true = erlang:demonitor(Ref, [flush]),        
+        true = erlang:demonitor(Ref, [flush])
     end, St#st.fd_monitors),
     ok.
 
 
 monitored_by(St) ->
     lists:foreach(fun(Fd, Acc) ->
-        case erlang:process_info(couch_ngen_file:pid(Fd)), monitored_by) of
+        case erlang:process_info(couch_ngen_file:pid(Fd), monitored_by) of
             {monitred_by, MB} ->
                 lists:umerge(lists:usort(MB), Acc);
             _ ->
@@ -273,7 +274,7 @@ read_doc(#st{} = St, Ptr) ->
 
 
 make_doc_summary(#st{}, {Body, Atts}) ->
-    ?term_to_bin({Body, Attts}).
+    ?term_to_bin({Body, Atts}).
 
 
 write_doc_summary(#st{} = St, Bin) ->
@@ -282,7 +283,7 @@ write_doc_summary(#st{} = St, Bin) ->
     } = St,
     {ok, {Pos, Len}} = couch_ngen_file:append_bin(Fd, Bin, [{hash, sha512}]),
     {ok, {Pos, Len}, Len}.
-    
+
 
 write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
     #st{
@@ -294,9 +295,11 @@ write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
         {AddAcc, RemIdsAcc, RemSeqsAcc} = Acc,
         case {OldFDI, NewFDI} of
             {not_found, #full_doc_info{}} ->
-                {[NewFDI | AddAcc], RemIdsAcc, RemSeqsAcc};
+                FDIKV = write_doc_info(St, NewFDI),
+                {[FDIKV | AddAcc], RemIdsAcc, RemSeqsAcc};
             {#full_doc_info{id = Id}, #full_doc_info{id = Id}} ->
-                NewAddAcc = [NewFDI | AddAcc],
+                FDIKV = write_doc_info(St, NewFDI),
+                NewAddAcc = [FDIKV | AddAcc],
                 NewRemSeqsAcc = [OldFDI#full_doc_info.update_seq | RemSeqsAcc],
                 {NewAddAcc, RemIdsAcc, NewRemSeqsAcc};
             {#full_doc_info{id = Id}, not_found} ->
@@ -357,7 +360,7 @@ commit_data(St) ->
 
             if not Before -> ok; true ->
                 [couch_ngen_file:sync(Fd) || Fd <- Fds]
-            end
+            end,
 
             ok = write_header(St#st.cp_fd, St#st.idx_fd, NewHeader),
 
@@ -440,8 +443,8 @@ start_compaction(St, DbName, Options, Parent) ->
     {ok, St, Pid}.
 
 
-finish_compaction(OldState, DbName, Options, CompactFilePath) ->
-    {ok, NewState1} = ?MODULE:init(CompactFilePath, Options),
+finish_compaction(OldState, DbName, Options, DirPath) ->
+    {ok, NewState1} = ?MODULE:init(DirPath, [compactor | Options]),
     OldSeq = ?MODULE:get(OldState, update_seq),
     NewSeq = ?MODULE:get(NewState1, update_seq),
     case OldSeq == NewSeq of
@@ -456,22 +459,13 @@ finish_compaction(OldState, DbName, Options, CompactFilePath) ->
     end.
 
 
-id_tree_split(#full_doc_info{}=Info) ->
-    #full_doc_info{
-        id = Id,
-        update_seq = Seq,
-        deleted = Deleted,
-        sizes = SizeInfo,
-        rev_tree = Tree
-    } = Info,
-    {Id, {Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree)}}.
+id_seq_tree_split({DocId, Ptr}, _DataFd) ->
+    {DocId, Ptr}.
 
 
-id_tree_join(Id, {HighSeq, Deleted, DiskTree}) ->
-    % Handle old formats before data_size was added
-    id_tree_join(Id, {HighSeq, Deleted, #size_info{}, DiskTree});
-
-id_tree_join(Id, {HighSeq, Deleted, Sizes, DiskTree}) ->
+id_seq_tree_join(Id, DiskPtr, DataFd) ->
+    {ok, DiskTerm} = couch_ngen_file:read_term(DataFd, DiskPtr),
+    {HighSeq, Deleted, Sizes, DiskTree} = DiskTerm,
     #full_doc_info{
         id = Id,
         update_seq = HighSeq,
@@ -502,45 +496,6 @@ id_tree_reduce(rereduce, Reds) ->
     end, {0, 0, #size_info{}}, Reds).
 
 
-seq_tree_split(#full_doc_info{}=Info) ->
-    #full_doc_info{
-        id = Id,
-        update_seq = Seq,
-        deleted = Del,
-        sizes = SizeInfo,
-        rev_tree = Tree
-    } = Info,
-    {Seq, {Id, ?b2i(Del), split_sizes(SizeInfo), disk_tree(Tree)}}.
-
-
-seq_tree_join(Seq, {Id, Del, DiskTree}) when is_integer(Del) ->
-    seq_tree_join(Seq, {Id, Del, {0, 0}, DiskTree});
-
-seq_tree_join(Seq, {Id, Del, Sizes, DiskTree}) when is_integer(Del) ->
-    #full_doc_info{
-        id = Id,
-        update_seq = Seq,
-        deleted = ?i2b(Del),
-        sizes = join_sizes(Sizes),
-        rev_tree = rev_tree(DiskTree)
-    };
-
-seq_tree_join(KeySeq, {Id, RevInfos, DeletedRevInfos}) ->
-    % Older versions stored #doc_info records in the seq_tree.
-    % Compact to upgrade.
-    Revs = lists:map(fun({Rev, Seq, Bp}) ->
-        #rev_info{rev = Rev, seq = Seq, deleted = false, body_sp = Bp}
-    end, RevInfos),
-    DeletedRevs = lists:map(fun({Rev, Seq, Bp}) ->
-        #rev_info{rev = Rev, seq = Seq, deleted = true, body_sp = Bp}
-    end, DeletedRevInfos),
-    #doc_info{
-        id = Id,
-        high_seq = KeySeq,
-        revs = Revs ++ DeletedRevs
-    }.
-
-
 seq_tree_reduce(reduce, DocInfos) ->
     % count the number of documents
     length(DocInfos);
@@ -548,26 +503,22 @@ seq_tree_reduce(rereduce, Reds) ->
     lists:sum(Reds).
 
 
-local_tree_split(#doc{} = Doc) ->
+local_tree_split(#doc{} = Doc, DataFd) ->
     #doc{
         id = Id,
         revs = {0, [Rev]},
         body = BodyData
     } = Doc,
-    {Id, {Rev, BodyData}}.
+    DiskTerm = {Rev, BodyData},
+    {ok, Ptr} = couch_ngen_file:append_term(DataFd, DiskTerm, [{hash, crc32}]),
+    {Id, Ptr}.
 
 
-local_tree_join(Id, {Rev, BodyData}) when is_binary(Rev) ->
+local_tree_join(Id, Ptr, DataFd) ->
+    {ok, {Rev, BodyData}} = couch_ngen_file:read_term(DataFd, Ptr),
     #doc{
         id = Id,
         revs = {0, [Rev]},
-        body = BodyData
-    };
-
-local_tree_join(Id, {Rev, BodyData}) when is_integer(Rev) ->
-    #doc{
-        id = Id,
-        revs = {0, [list_to_binary(integer_to_list(Rev))]},
         body = BodyData
     }.
 
@@ -582,7 +533,7 @@ read_header(CPFd, IdxFd) ->
 % are the first 32 bytes and then 16 for the last
 % possible header position makes 48
 read_header(CPFd, IdxFd, FileSize) when FileSize >= 48 ->
-    Ptr = {Bytes - 16, 16},
+    Ptr = {FileSize - 16, 16},
     {ok, <<Pos:64, Len:64>>} = couch_ngen_file:read_bin(CPFd, Ptr),
     case couch_ngen_file:read_term(IdxFd, {Pos, Len}) of
         {ok, Header} ->
@@ -599,25 +550,31 @@ write_header(CPFd, IdxFd, Header) ->
     {ok, {Pos, Len}} = couch_ngen_file:append_term(IdxFd, Header),
 
     CPSize = couch_ngen_file:bytes(CPFd),
-    if CPSize /= 16 == 0 -> ok; true ->
+    if (CPSize rem 16) == 0 -> ok; true ->
         throw({invalid_commits_file, CPSize})
     end,
 
     CPBin = <<Pos:64, Len:64>>,
-    {ok, _} = couch_ngen_file:append_bin(CPFd, Header),
+    {ok, _} = couch_ngen_file:append_bin(CPFd, CPBin),
     ok.
 
 
 open_db_files(DirPath, Options) ->
+    CPPath = filename:join(DirPath, "COMMITS"),
     case couch_ngen_file:open(CPPath, Options) of
         {ok, Fd} ->
             open_idx_data_files(DirPath, Fd, Options);
         {error, enoent} ->
+            % If we're recovering from a COMMITS.compact we
+            % only treat that as valid if we've already
+            % moved the index and data files or else compaction
+            % wasn't finished. Hence why we're not renaming them
+            % here.
             case couch_ngen_file:open(CPPath ++ ".compact") of
                 {ok, Fd} ->
                     Fmt = "Recovering from compaction file: ~s~s",
-                    couch_log:info(Fmt, [FilePath, ".compact"]),
-                    ok = nifile:rename(FilePath ++ ".compact", FilePath),
+                    couch_log:info(Fmt, [CPPath, ".compact"]),
+                    ok = couch_ngen_file:rename(Fd, CPPath),
                     ok = couch_ngen_file:sync(Fd),
                     open_idx_data_files(DirPath, Fd, Options);
                 {error, enoent} ->
@@ -628,14 +585,14 @@ open_db_files(DirPath, Options) ->
     end.
 
 
-open_idx_data_files(DirPath, CPFd, Opts) ->
-    {ok, IdxPath, DataPath} = get_file_paths(CPFd, DirPath),
-    {ok, IdxFd} = couch_ngen_file:open(IdxName, Opts),
-    {ok, DataFd} = couch_ngen_file:open(DataName, Opts),
+open_idx_data_files(DirPath, CPFd, Options) ->
+    {ok, IdxPath, DataPath} = get_file_paths(CPFd, DirPath, Options),
+    {ok, IdxFd} = couch_ngen_file:open(IdxPath, Options),
+    {ok, DataFd} = couch_ngen_file:open(DataPath, Options),
     {ok, CPFd, IdxFd, DataFd}.
 
 
-get_file_paths(CPFd, DirPath) ->
+get_file_paths(CPFd, DirPath, Options) ->
     case couch_ngen_file:read_bin(CPFd, {0, 32}) of
         {ok, <<>>} ->
             IdxName = couch_uuids:random(),
@@ -644,17 +601,19 @@ get_file_paths(CPFd, DirPath) ->
             {ok, _} = couch_ngen_file:append_binary(CPFd, DataName),
             couch_ngen_file:sync(CPFd),
 
-            IdxPath = filename:join(DirPath, IdxName),
+            IdxPath = db_filepath(DirPath, IdxName, Options),
             {ok, IdxFd} = couch_ngen_file:open(IdxPath, [create]),
             couch_nge_file:close(IdxFd),
 
-            DataPath = filename:join(DirPath, DataName),
+            DataPath = db_filepath(DirPath, DataName, Options),
             {ok, DataFd} = couch_ngen_file:open(DataPath, [create]),
             couch_ngen_file:close(DataFd),
 
             {IdxPath, DataPath};
-        {ok, <<IdxName0:16/binary, DataName0:16/binary>>} ->
-            {filename:join(DirPath, IdxName), filename:join(DirPath, DataName)};
+        {ok, <<IdxName:16/binary, DataName:16/binary>>} ->
+            IdxPath = db_filepath(DirPath, IdxName, Options),
+            DataPath = db_filepath(DirPath, DataName, Options),
+            {IdxPath, DataPath};
         {ok, _BadBin} ->
             erlang:error(corrupt_checkpoints_file);
         Error ->
@@ -669,32 +628,35 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
 
     FsyncOnOpen = lists:member(on_file_open, FsyncOptions),
     if not FsyncOnOpen -> ok; true ->
-        [ok = couch_ngen_file:sync(Fd) || Fd <- [CPFd, IdxFd, DataFd]];
+        [ok = couch_ngen_file:sync(Fd) || Fd <- [CPFd, IdxFd, DataFd]]
     end,
 
     Header = couch_ngen_header:upgrade(Header0),
 
     IdTreeState = couch_ngen_header:id_tree_state(Header),
-    {ok, IdTree} = couch_ngen_btree:open(IdTreeState, Fd, [
-            {split, fun ?MODULE:id_tree_split/1},
-            {join, fun ?MODULE:id_tree_join/2},
-            {reduce, fun ?MODULE:id_tree_reduce/2}
+    {ok, IdTree} = couch_ngen_btree:open(IdTreeState, IdxFd, [
+            {split, fun ?MODULE:id_seq_tree_split/2},
+            {join, fun ?MODULE:id_seq_tree_join/3},
+            {reduce, fun ?MODULE:id_tree_reduce/2},
+            {user_ctx, DataFd}
         ]),
 
     SeqTreeState = couch_ngen_header:seq_tree_state(Header),
-    {ok, SeqTree} = couch_ngen_btree:open(SeqTreeState, Fd, [
-            {split, fun ?MODULE:seq_tree_split/1},
-            {join, fun ?MODULE:seq_tree_join/2},
-            {reduce, fun ?MODULE:seq_tree_reduce/2}
+    {ok, SeqTree} = couch_ngen_btree:open(SeqTreeState, IdxFd, [
+            {split, fun ?MODULE:id_seq_tree_split/2},
+            {join, fun ?MODULE:id_seq_tree_join/3},
+            {reduce, fun ?MODULE:seq_tree_reduce/2},
+            {user_ctx, DataFd}
         ]),
 
     LocalTreeState = couch_ngen_header:local_tree_state(Header),
-    {ok, LocalTree} = couch_ngen_btree:open(LocalTreeState, Fd, [
-            {split, fun ?MODULE:local_tree_split/1},
-            {join, fun ?MODULE:local_tree_join/2}
+    {ok, LocalTree} = couch_ngen_btree:open(LocalTreeState, IdxFd, [
+            {split, fun ?MODULE:local_tree_split/2},
+            {join, fun ?MODULE:local_tree_join/3},
+            {user_ctx, DataFd}
         ]),
 
-    [couch_ngen_file:set_db_pid(Fd, self()) || Fd <- [CPFd, IdxFd, DataFD]],
+    [couch_ngen_file:set_db_pid(Fd, self()) || Fd <- [CPFd, IdxFd, DataFd]],
 
     St = #st{
         dirpath = DirPath,
@@ -711,8 +673,7 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
         needs_commit = false,
         id_tree = IdTree,
         seq_tree = SeqTree,
-        local_tree = LocalTree,
-        compression = Compression
+        local_tree = LocalTree
     },
 
     % If we just created a new UUID while upgrading a
@@ -740,6 +701,20 @@ update_header(St, Header) ->
 delete_compaction_files(DirPath) ->
     RootDir = config:get("couchdb", "database_dir", "."),
     delete_compaction_files(RootDir, DirPath).
+
+
+write_doc_info(St, FDI) ->
+    #full_doc_info{
+        id = Id,
+        update_seq = Seq,
+        deleted = Deleted,
+        sizes = SizeInfo,
+        rev_tree = Tree
+    } = FDI,
+    DataFd = St#st.data_fd,
+    DiskTerm = {Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree)},
+    {ok, Ptr} = couch_ngen_file:append_term(DataFd, DiskTerm, [{hash, crc32}]),
+    {Id, Ptr}.
 
 
 rev_tree(DiskTree) ->
@@ -788,10 +763,6 @@ disk_tree(RevTree) ->
 
 split_sizes(#size_info{}=SI) ->
     {SI#size_info.active, SI#size_info.external}.
-
-
-join_sizes({Active, External}) when is_integer(Active), is_integer(External) ->
-    #size_info{active=Active, external=External}.
 
 
 reduce_sizes(nil, _) ->
@@ -862,11 +833,11 @@ fold_docs_reduce_to_count(Reds) ->
 
 finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
     #st{
-        dirpath = FilePath,
+        dirpath = DirPath,
         local_tree = OldLocal
     } = OldSt,
     #st{
-        dirpath = CompactDataPath,
+        dirpath = DirPath,
         local_tree = NewLocal1
     } = NewSt1,
 
@@ -883,24 +854,44 @@ finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
         local_tree = NewLocal2
     }),
 
-    % Rename our *.compact.data file to *.compact so that if we
-    % die between deleting the old file and renaming *.compact
-    % we can recover correctly.
-    ok = file:rename(CompactDataPath, FilePath ++ ".compact"),
+    % Move our compaction files into place
+    ok = remove_compact_suffix(NewSt3#st.idx_fd),
+    ok = remove_compact_suffix(NewSt3#st.data_fd),
+    ok = delete_fd(NewSt3#st.idx_fd),
 
-    % Remove the uncompacted database file
-    RootDir = config:get("couchdb", "database_dir", "."),
-    couch_file:delete(RootDir, FilePath),
+    % Remove the old database files
+    ok = delete_fd(OldSt#st.data_fd),
+    ok = delete_fd(OldSt#st.idx_fd),
+    ok = delete_fd(OldSt#st.cp_fd),
 
-    % Move our compacted file into its final location
-    ok = file:rename(FilePath ++ ".compact", FilePath),
+    % Final swap to finish compaction
+    ok = remove_compact_suffix(NewSt3#st.cp_fd),
 
-    % Delete the old meta compaction file after promoting
-    % the compaction file.
-    couch_file:delete(RootDir, FilePath ++ ".compact.meta"),
-
-    % We're finished with our old state
     decref(OldSt),
-
-    % And return our finished new state
     {ok, NewSt3, undefined}.
+
+
+remove_compact_suffix(Fd) ->
+    Path = couch_ngen_file:path(Fd),
+    PathWithoutCompact = size(Path) - size(<<".compact">>),
+    <<FileName:PathWithoutCompact/binary, ".compact">> = Path,
+    couch_ngen_file:rename(Fd, FileName).
+
+
+delete_fd(Fd) ->
+    RootDir = conifg:get("couchdb", "database_dir", "."),
+    DelDir = filename:join(RootDir, ".delete"),
+    DelFname = filename:join(DelDir, couch_uuids:random()),
+    couch_ngen_file:rename(Fd, DelFname).
+
+
+db_filepath(DirPath, BaseName, Options) ->
+    case lists:member(compactor, Options) of
+        true when is_list(BaseName) ->
+            filename:join(DirPath, BaseName ++ ".compact");
+        true when is_binary(BaseName) ->
+            filename:join(DirPath, binary_to_list(BaseName) ++ ".compact");
+        false ->
+            filename:join(DirPath, BaseName)
+    end.
+

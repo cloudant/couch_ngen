@@ -26,6 +26,7 @@
 
 
 -record(st, {
+    path,
     fd,
     is_sys = false,
     eof = 0,
@@ -38,7 +39,8 @@
     init_delete_dir/1,
     delete/2,
     delete/3,
-    nuke_dir/2
+    nuke_dir/2,
+    nuke_dir/3
 ]).
 
 -export([
@@ -46,10 +48,12 @@
     open/2,
     close/1,
 
-    set_db_pid/1,
+    set_db_pid/2,
 
     length/1,
 
+    rename/2,
+    path/1,
     bytes/1,
     sync/1,
     truncate/2,
@@ -81,7 +85,7 @@ init_delete_dir(RootDir) ->
         lists:foreach(fun(FileName) ->
             FilePath = filename:join(Dir, FileName),
             ok = nifile:remove(FilePath)
-        end)
+        end, Files)
     end),
     ok.
 
@@ -91,8 +95,9 @@ delete(RootDir, FilePath) ->
 
 
 delete(RootDir, FilePath, Async) ->
-    DelFile = filename:join([RootDir,".delete", ?b2l(couch_uuids:random())]),
-    case nifile:rename(Filepath, DelFile) of
+    UUID = binary_to_list(couch_uuids:random()),
+    DelFile = filename:join([RootDir,".delete", UUID]),
+    case nifile:rename(FilePath, DelFile) of
         ok ->
             case Async of
                 true -> spawn(nifile, remove, [DelFile]);
@@ -101,6 +106,10 @@ delete(RootDir, FilePath, Async) ->
         Error ->
             Error
     end.
+
+
+nuke_dir(RootDelDir, Dir) ->
+    nuke_dir(RootDelDir, Dir, true).
 
 
 nuke_dir(RootDelDir, Dir, Async) ->
@@ -148,6 +157,17 @@ sync(#ngenfd{} = Fd) ->
     gen_server:call(Fd#ngenfd.fd, sync, infinity).
 
 
+rename(#ngenfd{} = Fd, TgtPath) ->
+    gen_server:call(Fd#ngenfd.fd, {rename, TgtPath}, infinity);
+
+rename(SrcPath, TgtPath) ->
+    nifile:rename(SrcPath, TgtPath).
+
+
+path(#ngenfd{} = Fd) ->
+    gen_server:call(Fd#ngenfd.fd, path, infinity).
+
+
 bytes(#ngenfd{} = Fd) ->
     gen_server:call(Fd#ngenfd.fd, bytes, infinity).
 
@@ -172,10 +192,10 @@ append_bin(Fd, Bin, Opts) ->
             <<0, Bin/binary>>;
         {Name, ValueBin} ->
             NameBin = list_to_binary(atom_to_list(Name)),
-            NameSize = size(NameStr),
+            NameSize = size(NameBin),
             ValueSize = size(ValueBin),
             true = NameSize < 256 andalso ValueSize < 256,
-            <<Size:8, ValueSize:8, NameBin/binary, ValueBin/binary, Bin>>
+            <<NameSize:8, ValueSize:8, NameBin/binary, ValueBin/binary, Bin>>
     end,
     gen_server:call(Fd#ngenfd.fd, {append, FileBin}).
 
@@ -212,8 +232,8 @@ init({FilePath, Parent, Options}) ->
 
     case nifile:open(FilePath, OpenOpts) of
         {ok, Fd} ->
-            St = init_st(Fd, Parent, Options),
-            ExtFd = #ngenfd{fd = Fd, t2bopts = St#st.t2bopts}
+            St = init_st(FilePath, Fd, Parent, Options),
+            ExtFd = #ngenfd{fd = Fd, t2bopts = St#st.t2bopts},
             proc_lib:init_ack({ok, ExtFd}),
             gen_server:enter_loop(?MODULE, [], Fd, ?INITIAL_WAIT);
         Error ->
@@ -221,18 +241,17 @@ init({FilePath, Parent, Options}) ->
     end.
 
 
-terminate(_Reason, File) ->
-    if File#file.fd == undefined -> ok; true ->
-        nifile:close(File#file.fd)
+terminate(_Reason, St) ->
+    if St#st.fd == undefined -> ok; true ->
+        nifile:close(St#st.fd)
     end.
 
 
-handle_call(close, _From, #file{fd=Fd}=File) ->
-    {stop, normal, nifile:close(Fd), File#file{fd = undefined}};
+handle_call(close, _From, #st{fd=Fd}=St) ->
+    {stop, normal, nifile:close(Fd), St#st{fd = undefined}};
 
-
-handle_call({set_db_pid, Pid}, _From, File) ->
-    OldPid = File#file.db_pid,
+handle_call({set_db_pid, Pid}, _From, St) ->
+    OldPid = St#st.db_pid,
     if not is_pid(OldPid) -> ok; true ->
         unlink(OldPid),
         receive
@@ -241,48 +260,55 @@ handle_call({set_db_pid, Pid}, _From, File) ->
         end
     end,
     link(Pid),
-    {reply, ok, File#file{db_pid=Pid}, ?MONITOR_CHECK};
+    {reply, ok, St#st{db_pid=Pid}, ?MONITOR_CHECK};
 
-
-handle_call(bytes, _From, File) ->
-    {ok, Bytes} = nifile:seek(File#file.fd, 0, seek_end),
-    if Bytes == File#file.eof -> ok; true ->
-        {stop, invalid_eof, invalid_eof, File}
-    end,
-    {reply, Bytes, File, ?MONITOR_CHECK};
-
-
-handle_call(sync, _From, File) ->
-    {reply, nifile:sync(File#file.fd), File, ?MONITOR_CHECK};
-
-
-handle_call({truncate, Pos}, _From, File) ->
-    {ok, Pos} = nifile:seek(Fd, Pos, seek_set),
-    case nifile:truncate(Fd, Pos) of
-        ok -> {reply, ok, File#file{eof = Pos}, ?MONITOR_CHECK};
-        Error -> {reply, Error, File, ?MONITOR_CHECK}
+handle_call({rename, TgtPath}, _From, St) ->
+    case nifile:rename(St#st.path, TgtPath) of
+        ok ->
+            {reply, ok, St#st{path = TgtPath}};
+        Else ->
+            {reply, Else, St}
     end;
 
-handle_call({append, Bin}, _From, File) ->
-    #file{
-        fd = Fd,
+handle_call(path, _From, St) ->
+    {reply, St#st.path, St};
+
+handle_call(bytes, _From, St) ->
+    {ok, Bytes} = nifile:seek(St#st.fd, 0, seek_end),
+    if Bytes == St#st.eof -> ok; true ->
+        {stop, invalid_eof, invalid_eof, St}
+    end,
+    {reply, Bytes, St, ?MONITOR_CHECK};
+
+handle_call(sync, _From, St) ->
+    {reply, nifile:sync(St#st.fd), St, ?MONITOR_CHECK};
+
+handle_call({truncate, Pos}, _From, St) ->
+    {ok, Pos} = nifile:seek(St#st.fd, Pos, seek_set),
+    case nifile:truncate(St#st.fd, Pos) of
+        ok -> {reply, ok, St#st{eof = Pos}, ?MONITOR_CHECK};
+        Error -> {reply, Error, St, ?MONITOR_CHECK}
+    end;
+
+handle_call({append, Bin}, _From, St) ->
+    #st{
         eof = Eof
-    } = File,
+    } = St,
 
     BinSize = size(Bin),
-    case nifile:write(File#file.fd, Bin) of
+    case nifile:write(St#st.fd, Bin) of
         {ok, BinSize} ->
-            NewFile = File#file{
+            NewSt = St#st{
                 eof = Eof + BinSize
             },
-            {reply, {ok, {Eof, BinSize}}, NewFile, ?MONITOR_CHECK};
+            {reply, {ok, {Eof, BinSize}}, NewSt, ?MONITOR_CHECK};
         {ok, WrongSize} ->
-            NewFile = File#file{
+            NewSt = St#st{
                 eof = Eof + WrongSize
             },
-            {reply, {error, incomplete_write}, NewFile, ?MONITOR_CHECK};
+            {reply, {error, incomplete_write}, NewSt, ?MONITOR_CHECK};
         Error ->
-            {reply, Error, File, ?MONITOR_CHECK}
+            {reply, Error, St, ?MONITOR_CHECK}
     end.
 
 
@@ -290,32 +316,32 @@ handle_cast(close, Fd) ->
     {stop, normal, Fd}.
 
 
-handle_info(timeout, File) ->
-    case is_idle(File) of
+handle_info(timeout, St) ->
+    case is_idle(St) of
         true ->
-            {stop, normal, File};
+            {stop, normal, St};
         false ->
-            {noreply, File, ?MONITOR_CHECK}
+            {noreply, St, ?MONITOR_CHECK}
     end;
 
-handle_info({'EXIT', Pid, _}, #file{db_pid = Pid} = File) ->
-    case is_idle(File) of
-        true -> {stop, normal, File};
-        false -> {noreply, File, ?MONITOR_CHECK}
+handle_info({'EXIT', Pid, _}, #st{db_pid = Pid} = St) ->
+    case is_idle(St) of
+        true -> {stop, normal, St};
+        false -> {noreply, St, ?MONITOR_CHECK}
     end;
 
-handle_info({'EXIT', _, normal}, Fd) ->
-    {noreply, Fd, ?MONITOR_CHECK};
+handle_info({'EXIT', _, normal}, St) ->
+    {noreply, St, ?MONITOR_CHECK};
 
-handle_info({'EXIT', _, Reason}, Fd) ->
-    {stop, Reason, Fd}.
-
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+handle_info({'EXIT', _, Reason}, St) ->
+    {stop, Reason, St}.
 
 
-init_fd(RawFd, Parent, Options) ->
+code_change(_OldVsn, St, _Extra) ->
+    {ok, St}.
+
+
+init_st(FilePath, RawFd, Parent, Options) ->
     maybe_track(Options),
     case proplists:get_value(overwrite, Options) of
         true ->
@@ -331,8 +357,9 @@ init_fd(RawFd, Parent, Options) ->
         _ ->
             []
     end,
-    {ok, Bytes} = nifile:seek(Fd, 0, seek_end),
-    #file{
+    {ok, Bytes} = nifile:seek(RawFd, 0, seek_end),
+    #st{
+        path = iolist_to_binary(FilePath),
         fd = RawFd,
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
@@ -342,19 +369,19 @@ init_fd(RawFd, Parent, Options) ->
 
 
 maybe_track(Options) ->
-    IsSys = list:member(sys_db, Options)
+    IsSys = list:member(sys_db, Options),
     if IsSys -> ok; true ->
-        couch_stats_process_tracker:track([couchdb_ngen, open_nifiles]);
+        couch_stats_process_tracker:track([couchdb_ngen, open_nifiles])
     end.
 
 
-is_idle(#file{is_sys = true}) ->
+is_idle(#st{is_sys = true}) ->
     case process_info(self(), monitored_by) of
         {monitored_by, []} -> true;
         _ -> false
     end;
 
-is_idle(#file{}) ->
+is_idle(#st{}) ->
     Tracker = whereis(couch_stats_process_tracker),
     case process_info(self(), monitored_by) of
         {monitored_by, []} -> true;
@@ -364,7 +391,7 @@ is_idle(#file{}) ->
     end.
 
 
-hash(Bin, Options) ->
+hash(Bin, Opts) ->
     case proplists:get_value(hash, Opts) of
         undefined -> undefined;
         true -> {adler32, erlang:adler32(Bin)};

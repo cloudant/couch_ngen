@@ -10,24 +10,41 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
--module(couch_btree).
+-module(couch_ngen_btree).
 
 -export([open/2, open/3, query_modify/4, add/2, add_remove/3]).
 -export([fold/4, full_reduce/1, final_reduce/2, size/1, foldl/3, foldl/4]).
 -export([fold_reduce/4, lookup/2, get_state/1, set_options/2]).
 -export([extract/2, assemble/3, less/3]).
 
--include_lib("couch/include/couch_db.hrl").
+-record(btree, {
+    fd,
+    root,
+    extract_kv,
+    assemble_kv,
+    user_ctx,
+    less,
+    reduce = nil
+}).
+
+
+-define(term_size(T),
+    try
+        erlang:external_size(T)
+    catch _:_ ->
+        byte_size(term_to_binary(T, [{minor_version, 1}]))
+    end).
+
 
 extract(#btree{extract_kv=undefined}, Value) ->
     Value;
-extract(#btree{extract_kv=Extract}, Value) ->
-    Extract(Value).
+extract(#btree{extract_kv=Extract, user_ctx=Ctx}, Value) ->
+    Extract(Value, Ctx).
 
 assemble(#btree{assemble_kv=undefined}, Key, Value) ->
     {Key, Value};
-assemble(#btree{assemble_kv=Assemble}, Key, Value) ->
-    Assemble(Key, Value).
+assemble(#btree{assemble_kv=Assemble, user_ctx=Ctx}, Key, Value) ->
+    Assemble(Key, Value, Ctx).
 
 less(#btree{less=undefined}, A, B) ->
     A < B;
@@ -44,12 +61,12 @@ set_options(Bt, [{split, Extract}|Rest]) ->
     set_options(Bt#btree{extract_kv=Extract}, Rest);
 set_options(Bt, [{join, Assemble}|Rest]) ->
     set_options(Bt#btree{assemble_kv=Assemble}, Rest);
+set_options(Bt, [{user_ctx, Ctx}|Rest]) ->
+    set_options(Bt#btree{user_ctx=Ctx}, Rest);
 set_options(Bt, [{less, Less}|Rest]) ->
     set_options(Bt#btree{less=Less}, Rest);
 set_options(Bt, [{reduce, Reduce}|Rest]) ->
-    set_options(Bt#btree{reduce=Reduce}, Rest);
-set_options(Bt, [{compression, Comp}|Rest]) ->
-    set_options(Bt#btree{compression=Comp}, Rest).
+    set_options(Bt#btree{reduce=Reduce}, Rest).
 
 open(State, Fd, Options) ->
     {ok, set_options(#btree{root=State, fd=Fd}, Options)}.
