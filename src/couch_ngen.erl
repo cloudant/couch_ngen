@@ -73,7 +73,7 @@
 
 exists(DirPath) ->
     CPFile = filename:join(DirPath, "COMMITS"),
-    filelib:is_dir(CPFile).
+    filelib:is_file(CPFile).
 
 
 delete(RootDir, DirPath, Async) ->
