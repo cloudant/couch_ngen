@@ -20,8 +20,11 @@
 
 
 -record(ngenfd, {
+    pid,
     fd,
-    t2bopts
+    raw = false,
+    t2bopts,
+    hash
 }).
 
 
@@ -46,6 +49,7 @@
 -export([
     open/1,
     open/2,
+    monitor/1,
     close/1,
 
     set_db_pid/2,
@@ -59,7 +63,6 @@
     truncate/2,
 
     append_term/2,
-    append_term/3,
     append_bin/2,
 
     read_term/2,
@@ -141,12 +144,16 @@ open(FilePath, Options) ->
     proc_lib:start_link(?MODULE, init, InitArg).
 
 
+monitor(#ngenfd{} = Fd) ->
+    erlang:monitor(process, Fd#ngenfd.pid).
+
+
 close(#ngenfd{} = Fd) ->
-    gen_server:call(Fd#ngenfd.fd, close, infinity).
+    gen_server:call(Fd#ngenfd.pid, close, infinity).
 
 
 set_db_pid(#ngenfd{} = Fd, Pid) ->
-    gen_server:call(Fd#ngenfd.fd, {set_db_pid, Pid}).
+    gen_server:call(Fd#ngenfd.pid, {set_db_pid, Pid}).
 
 
 length({Pos, Len}) when is_integer(Pos), is_integer(Len) ->
@@ -154,50 +161,52 @@ length({Pos, Len}) when is_integer(Pos), is_integer(Len) ->
 
 
 sync(#ngenfd{} = Fd) ->
-    gen_server:call(Fd#ngenfd.fd, sync, infinity).
+    gen_server:call(Fd#ngenfd.pid, sync, infinity).
 
 
 rename(#ngenfd{} = Fd, TgtPath) ->
-    gen_server:call(Fd#ngenfd.fd, {rename, TgtPath}, infinity);
+    gen_server:call(Fd#ngenfd.pid, {rename, TgtPath}, infinity);
 
 rename(SrcPath, TgtPath) ->
     nifile:rename(SrcPath, TgtPath).
 
 
 path(#ngenfd{} = Fd) ->
-    gen_server:call(Fd#ngenfd.fd, path, infinity).
+    gen_server:call(Fd#ngenfd.pid, path, infinity).
 
 
 bytes(#ngenfd{} = Fd) ->
-    gen_server:call(Fd#ngenfd.fd, bytes, infinity).
+    gen_server:call(Fd#ngenfd.pid, bytes, infinity).
 
 
 append_term(#ngenfd{} = Fd, Term) ->
     Bin = term_to_binary(Term, Fd#ngenfd.t2bopts),
-    append_bin(Fd, Bin, []).
+    append_bin(Fd, Bin).
 
 
-append_term(Fd, Term, Options) ->
-    Bin = term_to_binary(Term, Fd#ngenfd.t2bopts),
-    append_bin(Fd, Bin, Options).
+append_bin(Fd, Bin) when is_list(Bin) ->
+    append_bin(Fd, iolist_to_binary(Bin));
 
+append_bin(#ngenfd{raw = true} = Fd, Bin) ->
+    gen_server:call(Fd#ngenfd.pid, {append, Bin});
 
-append_bin(Fd, Bin) ->
-    append_bin(Fd, Bin, []).
+append_bin(#ngenfd{hash = undefined} = Fd, Bin) ->
+    gen_server:call(Fd#ngenfd.pid, {append, <<0, Bin/binary>>});
 
-
-append_bin(Fd, Bin, Opts) ->
-    FileBin = case hash(Bin, Opts) of
-        undefined ->
-            <<0, Bin/binary>>;
-        {Name, ValueBin} ->
-            NameBin = list_to_binary(atom_to_list(Name)),
-            NameSize = size(NameBin),
-            ValueSize = size(ValueBin),
-            true = NameSize < 256 andalso ValueSize < 256,
-            <<NameSize:8, ValueSize:8, NameBin/binary, ValueBin/binary, Bin>>
-    end,
-    gen_server:call(Fd#ngenfd.fd, {append, FileBin}).
+append_bin(Fd, Bin) when is_binary(Bin) ->
+    NameBin = list_to_binary(atom_to_list(Fd#ngenfd.hash)),
+    ValueBin = hash(Bin, Fd#ngenfd.hash),
+    NameSize = size(NameBin),
+    ValueSize = size(ValueBin),
+    true = NameSize < 256 andalso ValueSize < 256,
+    FileBin = <<
+            NameSize:8,
+            ValueSize:8,
+            NameBin/binary,
+            ValueBin/binary,
+            Bin/binary
+        >>,
+    gen_server:call(Fd#ngenfd.pid, {append, FileBin}).
 
 
 read_term(Fd, Ptr) ->
@@ -205,8 +214,11 @@ read_term(Fd, Ptr) ->
     {ok, binary_to_term(Bin)}.
 
 
+read_bin(#ngenfd{raw = true} = Fd, {Pos, Len}) ->
+    nifile:pread(Fd#ngenfd.fd, Len, Pos);
+
 read_bin(Fd, {Pos, Len}) ->
-    case nifile:pread(Fd, Len, Pos) of
+    case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
         {ok, <<0, Value/binary>>} ->
             {ok, Value};
         {ok, HashBin} ->
@@ -215,7 +227,7 @@ read_bin(Fd, {Pos, Len}) ->
 
 
 truncate(Fd, Pos) ->
-    gen_server:call(Fd, {truncate, Pos}, infinity).
+    gen_server:call(Fd#ngenfd.pid, {truncate, Pos}, infinity).
 
 
 init({FilePath, Parent, Options}) ->
@@ -233,9 +245,15 @@ init({FilePath, Parent, Options}) ->
     case nifile:open(FilePath, OpenOpts) of
         {ok, Fd} ->
             St = init_st(FilePath, Fd, Parent, Options),
-            ExtFd = #ngenfd{fd = Fd, t2bopts = St#st.t2bopts},
+            ExtFd = #ngenfd{
+                pid = self(),
+                fd = Fd,
+                raw = lists:member(raw, Options),
+                t2bopts = St#st.t2bopts,
+                hash = proplists:get_value(hash, Options)
+            },
             proc_lib:init_ack({ok, ExtFd}),
-            gen_server:enter_loop(?MODULE, [], Fd, ?INITIAL_WAIT);
+            gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
         Error ->
             proc_lib:init_ack(Error)
     end.
@@ -275,10 +293,10 @@ handle_call(path, _From, St) ->
 
 handle_call(bytes, _From, St) ->
     {ok, Bytes} = nifile:seek(St#st.fd, 0, seek_end),
-    if Bytes == St#st.eof -> ok; true ->
-        {stop, invalid_eof, invalid_eof, St}
-    end,
-    {reply, Bytes, St, ?MONITOR_CHECK};
+    case Bytes /= St#st.eof of
+        true -> {stop, invalid_eof, invalid_eof, St};
+        false -> {reply, {ok, Bytes}, St, ?MONITOR_CHECK}
+    end;
 
 handle_call(sync, _From, St) ->
     {reply, nifile:sync(St#st.fd), St, ?MONITOR_CHECK};
@@ -369,7 +387,7 @@ init_st(FilePath, RawFd, Parent, Options) ->
 
 
 maybe_track(Options) ->
-    IsSys = list:member(sys_db, Options),
+    IsSys = lists:member(sys_db, Options),
     if IsSys -> ok; true ->
         couch_stats_process_tracker:track([couchdb_ngen, open_nifiles])
     end.
@@ -391,22 +409,24 @@ is_idle(#st{}) ->
     end.
 
 
-hash(Bin, Opts) ->
-    case proplists:get_value(hash, Opts) of
-        undefined -> undefined;
-        true -> {adler32, erlang:adler32(Bin)};
-        adler32 -> {adler32, erlang:adler32(Bin)};
-        crc32 -> {crc32, erlang:crc32(Bin)};
-        phash2 -> {phash2, erlang:phash2(Bin)};
-        HashName -> {HashName, crypto:hash(HashName, Bin)}
+hash(Bin, Name) ->
+    case Name of
+        adler32 -> hbin(erlang:adler32(Bin));
+        crc32 -> hbin(erlang:crc32(Bin));
+        phash2 -> hbin(erlang:phash2(Bin));
+        HashName -> crypto:hash(HashName, Bin)
     end.
+
+
+hbin(Val) when is_integer(Val), Val >= 0, Val < 16#100000000 ->
+    <<Val:32/integer>>.
 
 
 verify(Bin) when is_binary(Bin), size(Bin) > 2 ->
     <<NameSize:8, ValueSize:8, Rest/binary>> = Bin,
     <<NameBin:NameSize/binary, Value:ValueSize/binary, Data/binary>> = Rest,
     Name = list_to_atom(binary_to_list(NameBin)),
-    case hash(Data, [{hash, Name}]) of
-        {Name, Value} -> {ok, Data};
-        {Name, OtherValue} -> {error, {hash_mismatch, Value, OtherValue}}
+    case hash(Data, Name) of
+        Value -> {ok, Data};
+        OtherValue -> {error, {hash_mismatch, Value, OtherValue}}
     end.

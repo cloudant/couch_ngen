@@ -285,7 +285,7 @@ order_chains(big, Chains) -> lists:reverse(lists:sort(Chains)).
 choose_kv(_Choose, _Ems, [{[KV], nil} | Rest]) ->
     {KV, Rest};
 choose_kv(Choose, Ems, [{[KV], Ptr} | RestChains]) ->
-    {ok, Chain} = couch_ngen_file:pread_term(Ems#ems.fd, Ptr),
+    {ok, Chain} = couch_ngen_file:read_term(Ems#ems.fd, Ptr),
     case Choose of
         small -> {KV, ins_small_chain(RestChains, Chain, [])};
         big -> {KV, ins_big_chain(RestChains, Chain, [])}
