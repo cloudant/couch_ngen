@@ -101,9 +101,7 @@ init(DirPath, Options) ->
     Header = case lists:member(create, Options) of
         true ->
             delete_compaction_files(DirPath),
-            Header0 = couch_ngen_header:new(),
-            ok = couch_ngen_file:append_term(IdxFd, Header0),
-            Header0;
+            couch_ngen_header:new();
         false ->
             case read_header(CPFd, IdxFd) of
                 {ok, Header0} ->
@@ -676,17 +674,12 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
         local_tree = LocalTree
     },
 
-    % If we just created a new UUID while upgrading a
-    % database then we want to flush that to disk or
-    % we risk sending out the uuid and having the db
-    % crash which would result in it generating a new
-    % uuid each time it was reopened.
-    case Header /= Header0 of
-        true ->
-            {ok, NewSt} = commit_data(St),
-            NewSt;
-        false ->
-            St
+    UpgradedHeader = Header /= Header0,
+    IsNewDb = couch_ngen_file:bytes(IdxFd) == 0,
+    NeedsUpgrade = UpgradedHeader orelse IsNewDb,
+    if not NeedsUpgrade -> St; true ->
+        {ok, NewSt} = commit_data(St),
+        NewSt
     end.
 
 
