@@ -137,7 +137,7 @@ open(FilePath) ->
 
 
 open(FilePath, Options) ->
-    InitArg = {FilePath, self(), Options},
+    InitArg = [{FilePath, self(), Options}],
     proc_lib:start_link(?MODULE, init, InitArg).
 
 
