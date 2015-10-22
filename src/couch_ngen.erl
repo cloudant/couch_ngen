@@ -157,13 +157,9 @@ decref(St) ->
 
 
 monitored_by(St) ->
-    lists:foreach(fun(Fd, Acc) ->
-        case erlang:process_info(couch_ngen_file:pid(Fd), monitored_by) of
-            {monitred_by, MB} ->
-                lists:umerge(lists:usort(MB), Acc);
-            _ ->
-                Acc
-        end
+    lists:foldl(fun(Fd, Acc) ->
+        MB = couch_ngen_file:monitored_by(Fd),
+        lists:umerge(lists:sort(MB), Acc)
     end, [], [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]).
 
 

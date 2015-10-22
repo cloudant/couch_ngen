@@ -50,6 +50,7 @@
     open/1,
     open/2,
     monitor/1,
+    monitored_by/1,
     close/1,
 
     set_db_pid/2,
@@ -146,6 +147,15 @@ open(FilePath, Options) ->
 
 monitor(#ngenfd{} = Fd) ->
     erlang:monitor(process, Fd#ngenfd.pid).
+
+
+monitored_by(#ngenfd{} = Fd) ->
+    case erlang:process_info(Fd#ngenfd.pid, monitored_by) of
+        {monitored_by, Pids} ->
+            Pids;
+        _ ->
+            []
+    end.
 
 
 close(#ngenfd{} = Fd) ->
