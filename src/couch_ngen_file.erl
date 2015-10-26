@@ -133,7 +133,8 @@ nuke_dir(RootDelDir, Dir, Async) ->
             lists:foreach(DelFun, Files);
         {error, enoent} ->
             ok
-    end.
+    end,
+    nifile:rmdir(Dir).
 
 
 open(FilePath) ->
