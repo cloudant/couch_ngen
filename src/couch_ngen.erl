@@ -281,10 +281,29 @@ open_local_docs(#st{} = St, DocIds) ->
 
 
 read_doc(#st{} = St, Ptr) ->
-    couch_ngen_file:read_term(St#st.data_fd, Ptr).
+    case couch_ngen_file:read_term(St#st.data_fd, Ptr) of
+        {ok, {Body, Atts0}} ->
+            Atts = couch_compress:decompress(Atts0),
+            {ok, {Body, Atts}};
+        Else ->
+            Else
+    end.
 
 
-make_doc_summary(#st{}, {Body, Atts}) ->
+make_doc_summary(#st{} = St, {Body0, Atts0}) ->
+    Comp = St#st.compression,
+    Body = case couch_compress:is_compressed(Body0, Comp) of
+        true ->
+            Body0;
+        false ->
+            couch_compress:compress(Body0, Comp)
+    end,
+    Atts = case couch_compress:is_compressed(Atts0, Comp) of
+        true ->
+            Atts0;
+        false ->
+            couch_compress:compress(Atts0, Comp)
+    end,
     ?term_to_bin({Body, Atts}).
 
 
@@ -658,7 +677,8 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
         needs_commit = false,
         id_tree = IdTree,
         seq_tree = SeqTree,
-        local_tree = LocalTree
+        local_tree = LocalTree,
+        compression = couch_compress:get_compression_method()
     },
 
     UpgradedHeader = Header /= Header0,
