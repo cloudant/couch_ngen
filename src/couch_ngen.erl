@@ -22,10 +22,10 @@
 
     open_docs/2,
     open_local_docs/2,
-    read_doc/2,
+    read_doc_body/2,
 
-    make_doc_summary/2,
-    write_doc_summary/2,
+    serialize_doc/2,
+    write_doc_body/2,
     write_doc_infos/4,
 
     commit_data/1,
@@ -117,7 +117,7 @@ init(DirPath, Options) ->
                     Header0;
                 no_valid_header ->
                     delete_compaction_files(DirPath),
-                    Header0 =  couch_db_header:new(),
+                    Header0 =  couch_ngen_header:new(),
                     ok = write_header(CPFd, IdxFd, Header0),
                     Header0
             end
@@ -280,39 +280,37 @@ open_local_docs(#st{} = St, DocIds) ->
     end, Results).
 
 
-read_doc(#st{} = St, Ptr) ->
-    case couch_ngen_file:read_term(St#st.data_fd, Ptr) of
+read_doc_body(#st{} = St, #doc{} = Doc) ->
+    case couch_ngen_file:read_term(St#st.data_fd, Doc#doc.body) of
         {ok, {Body, Atts0}} ->
             Atts = couch_compress:decompress(Atts0),
-            {ok, {Body, Atts}};
+            Doc#doc{
+                body = Body,
+                atts = Atts
+            };
         Else ->
             Else
     end.
 
 
-make_doc_summary(#st{} = St, {Body0, Atts0}) ->
-    Comp = St#st.compression,
-    Body = case couch_compress:is_compressed(Body0, Comp) of
-        true ->
-            Body0;
-        false ->
-            couch_compress:compress(Body0, Comp)
+serialize_doc(#st{} = St, #doc{} = Doc) ->
+    Compress = fun(Term) ->
+        case couch_compress:is_compressed(Term, St#st.compression) of
+            true -> Term;
+            false -> couch_compress:compress(Term, St#st.compression)
+        end
     end,
-    Atts = case couch_compress:is_compressed(Atts0, Comp) of
-        true ->
-            Atts0;
-        false ->
-            couch_compress:compress(Atts0, Comp)
-    end,
-    ?term_to_bin({Body, Atts}).
+    Body = Compress(Doc#doc.body),
+    Atts = Compress(Doc#doc.atts),
+    Doc#doc{body = ?term_to_bin({Body, Atts})}.
 
 
-write_doc_summary(#st{} = St, Bin) ->
+write_doc_body(#st{} = St, #doc{} = Doc) ->
     #st{
         data_fd = Fd
     } = St,
-    {ok, {Pos, Len}} = couch_ngen_file:append_bin(Fd, Bin),
-    {ok, {Pos, Len}, Len}.
+    {ok, {_Pos, Len} = Ptr} = couch_ngen_file:append_bin(Fd, Doc#doc.body),
+    {ok, Doc#doc{body = Ptr}, Len}.
 
 
 write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
