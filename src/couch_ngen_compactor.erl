@@ -314,11 +314,11 @@ copy_leaves(_Rev, #leaf{} = Leaf, leaf, {CompSt, SizesAcc}) ->
         ptr = Ptr
     } = Leaf,
 
-    {Body, Atts} = copy_doc_attachments(SrcSt, TgtSt, Ptr),
-    AttInfos = [couch_att:to_disk_term(A) || A <- Atts],
-    DocBin = couch_ngen:make_doc_summary(TgtSt, {Body, AttInfos}),
+    Doc = copy_doc_attachments(SrcSt, TgtSt, Ptr),
+    DiskAtts = [couch_att:to_disk_term(A) || A <- Doc#doc.atts],
+    DocBin = couch_ngen:serialize_doc(TgtSt, Doc#doc{atts = DiskAtts}),
 
-    {ok, NewPtr} = couch_ngen_file:append_bin(TgtSt#st.data_fd, DocBin),
+    {ok, NewPtr} = couch_ngen_file:append_bin(TgtSt#st.data_fd, DocBin#doc.body),
 
     AttSizeFun = fun(Att) ->
         [{_, Sp}, Size] = couch_att:fetch([data, att_len], Att),
@@ -329,15 +329,18 @@ copy_leaves(_Rev, #leaf{} = Leaf, leaf, {CompSt, SizesAcc}) ->
         ptr = NewPtr,
         sizes = #size_info{
             active = couch_ngen_file:length(Ptr),
-            external = ?term_size(Body)
+            external = ?term_size(Doc#doc.body)
         },
-        atts = lists:map(AttSizeFun, Atts)
+        atts = lists:map(AttSizeFun, Doc#doc.atts)
     },
     {NewLeaf, {CompSt, couch_db_updater:add_sizes(leaf, NewLeaf, SizesAcc)}}.
 
 
 copy_doc_attachments(SrcSt, TgtSt, DocPtr) ->
-    {ok, {Body, AttInfos}} = couch_ngen:read_doc(SrcSt, DocPtr),
+    #doc{
+        body = Body,
+        atts = AttInfos
+    } = couch_ngen:read_doc_body(SrcSt, #doc{body=DocPtr}),
 
     StreamFun = fun(Sp) -> couch_ngen:open_read_stream(SrcSt, Sp) end,
     LoadFun = fun(Info) -> couch_att:from_disk_term(StreamFun, Info) end,
@@ -349,7 +352,10 @@ copy_doc_attachments(SrcSt, TgtSt, DocPtr) ->
     end,
     CopiedAtts = lists:map(CopyFun, Atts),
 
-    {Body, CopiedAtts}.
+    #doc{
+       body = Body,
+       atts = CopiedAtts
+    }.
 
 
 sort_docids(CompSt) ->
