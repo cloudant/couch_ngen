@@ -1,3 +1,15 @@
+% Licensed under the Apache License, Version 2.0 (the "License"); you may not
+% use this file except in compliance with the License. You may obtain a copy of
+% the License at
+%
+%   http://www.apache.org/licenses/LICENSE-2.0
+%
+% Unless required by applicable law or agreed to in writing, software
+% distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+% WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+% License for the specific language governing permissions and limitations under
+% the License.
+
 -module(couch_ngen_compactor).
 
 
@@ -185,13 +197,8 @@ copy_compact(CompSt0) ->
     } = CompSt2,
 
     % Copy the security information over
-    {ok, TgtSt2} = case couch_ngen:get(SrcSt1, security) of
-        [] ->
-            couch_ngen:set(TgtSt1, security_ptr, nil);
-        SecObj ->
-            {ok, Ptr} = couch_ngen_file:append_term(TgtSt1#st.data_fd, SecObj),
-            couch_ngen:set(TgtSt1, security_ptr, Ptr)
-    end,
+    SecProps = couch_ngen:get(SrcSt1, security),
+    {ok, TgtSt2} = couch_ngen:set(TgtSt1, security, SecProps),
 
     FinalUpdateSeq = couch_ngen:get(SrcSt1, update_seq),
     {ok, TgtSt3} = couch_ngen:set(TgtSt2, update_seq, FinalUpdateSeq),

@@ -98,14 +98,14 @@ delete(RootDir, FilePath) ->
     delete(RootDir, FilePath, true).
 
 
-delete(RootDir, FilePath, Async) ->
+delete(RootDir, FilePath, DelOpts) ->
     UUID = binary_to_list(couch_uuids:random()),
     DelFile = filename:join([RootDir,".delete", UUID]),
     case nifile:rename(FilePath, DelFile) of
         ok ->
-            case Async of
+            case proplists:get_value(async, DelOpts) of
                 true -> spawn(nifile, remove, [DelFile]);
-                false -> nifile:remove(DelFile)
+                _ -> nifile:remove(DelFile)
             end;
         Error ->
             Error

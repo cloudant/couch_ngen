@@ -1,3 +1,15 @@
+% Licensed under the Apache License, Version 2.0 (the "License"); you may not
+% use this file except in compliance with the License. You may obtain a copy of
+% the License at
+%
+%   http://www.apache.org/licenses/LICENSE-2.0
+%
+% Unless required by applicable law or agreed to in writing, software
+% distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+% WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+% License for the specific language governing permissions and limitations under
+% the License.
+
 -module(couch_ngen).
 -behavior(couch_db_engine).
 
@@ -5,7 +17,7 @@
     exists/1,
 
     delete/3,
-    delete_compaction_files/2,
+    delete_compaction_files/3,
 
     init/2,
     terminate/2,
@@ -92,7 +104,7 @@ delete(RootDir, DirPath, Async) ->
     couch_ngen_file:nuke_dir(RootDir, DirPath, Async).
 
 
-delete_compaction_files(RootDir, DirPath) ->
+delete_compaction_files(RootDir, DirPath, _DelOpts) ->
     nifile:lsdir(DirPath, fun(FName, _) ->
         FNameLen = size(FName),
         WithoutCompact = FNameLen - 8,
@@ -208,13 +220,9 @@ get(#st{} = St, size_info, _) ->
     ];
 
 get(#st{} = St, security, _) ->
-    case ?MODULE:get(St, security_ptr, nil) of
-        nil ->
-            [];
-        Pointer ->
-            {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
-            SecProps
-    end;
+    Pointer = ?MODULE:get(St, security_ptr, undefined),
+    {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
+    SecProps;
 
 get(#st{header = Header}, DbProp, Default) ->
     couch_ngen_header:get(Header, DbProp, Default).
@@ -633,7 +641,8 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
         [ok = couch_ngen_file:sync(Fd) || Fd <- [CPFd, IdxFd, DataFd]]
     end,
 
-    Header = couch_ngen_header:upgrade(Header0),
+    Header1 = couch_ngen_header:upgrade(Header0),
+    Header = set_default_security_object(DataFd, Header1, Options),
 
     IdTreeState = couch_ngen_header:id_tree_state(Header),
     {ok, IdTree} = couch_ngen_btree:open(IdTreeState, IdxFd, [
@@ -696,9 +705,20 @@ update_header(St, Header) ->
     ]).
 
 
+set_default_security_object(Fd, Header, Options) ->
+    case couch_ngen_header:get(Header, security_ptr) of
+        Pointer when is_tuple(Pointer) ->
+            Header;
+        _ ->
+            Default = couch_util:get_value(default_security_object, Options),
+            {ok, Ptr} = couch_ngen_file:append_term(Fd, Default),
+            couch_ngen_header:set(Header, security_ptr, Ptr)
+    end.
+
+
 delete_compaction_files(DirPath) ->
     RootDir = config:get("couchdb", "database_dir", "."),
-    delete_compaction_files(RootDir, DirPath).
+    delete_compaction_files(RootDir, DirPath, []).
 
 
 get_write_info(St, Pairs) ->
