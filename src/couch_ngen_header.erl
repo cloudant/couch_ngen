@@ -31,8 +31,10 @@
     seq_tree_state/1,
     latest/1,
     local_tree_state/1,
+    purge_tree_state/1,
     purge_seq/1,
-    purged_docs/1,
+    compact_purge_seq/1,
+    purged_docs_limit/1,
     security_ptr/1,
     revs_limit/1,
     uuid/1,
@@ -61,12 +63,14 @@
     seq_tree_state = nil,
     local_tree_state = nil,
     purge_seq = 0,
-    purged_docs = nil,
+    purge_tree_state = nil,
     security_ptr = nil,
     revs_limit = 1000,
     uuid,
     epochs,
-    compacted_seq
+    compacted_seq,
+    purged_docs_limit = 1000,
+    compact_purge_seq = 0 % purge seq when compact starts
 }).
 
 
@@ -150,12 +154,20 @@ local_tree_state(Header) ->
     get_field(Header, local_tree_state).
 
 
+purge_tree_state(Header) ->
+    get_field(Header, purge_tree_state).
+
+
 purge_seq(Header) ->
     get_field(Header, purge_seq).
 
 
-purged_docs(Header) ->
-    get_field(Header, purged_docs).
+compact_purge_seq(Header) ->
+    get_field(Header, compact_purge_seq).
+
+
+purged_docs_limit(Header) ->
+    get_field(Header, purged_docs_limit).
 
 
 security_ptr(Header) ->
@@ -323,7 +335,7 @@ mk_header(Vsn) ->
         bar, % seq_tree_state
         bam, % local_tree_state
         1, % purge_seq
-        baz, % purged_docs
+        baz, % purge_info
         bang, % security_ptr
         999 % revs_limit
     }.
@@ -343,7 +355,7 @@ upgrade_v3_test() ->
     ?assertEqual(bar, seq_tree_state(NewHeader)),
     ?assertEqual(bam, local_tree_state(NewHeader)),
     ?assertEqual(1, purge_seq(NewHeader)),
-    ?assertEqual(baz, purged_docs(NewHeader)),
+    ?assertEqual(baz, purge_tree_state(NewHeader)),
     ?assertEqual(bang, security_ptr(NewHeader)),
     ?assertEqual(999, revs_limit(NewHeader)),
     ?assertEqual(undefined, uuid(NewHeader)),

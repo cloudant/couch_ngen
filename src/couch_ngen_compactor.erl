@@ -61,7 +61,6 @@ start(#st{} = St, DbName, Options, Parent) ->
     add_compact_task(CompSt, DbName),
 
     Stages = [
-        fun copy_purge_info/1,
         fun copy_compact/1,
         fun sort_docids/1,
         fun copy_docids/1,
@@ -136,31 +135,6 @@ init_compaction(SrcSt, Options1) ->
         idsort_fd = IdSortFd,
         idsort = IdSort
     }}.
-
-
-copy_purge_info(CompSt) ->
-    #comp_st{
-        src_st = SrcSt,
-        tgt_st = TgtSt
-    } = CompSt,
-    SrcHdr = SrcSt#st.header,
-    TgtHdr = TgtSt#st.header,
-    SrcPurgeSeq = couch_ngen_header:purge_seq(SrcHdr),
-    NewTgtSt = case SrcPurgeSeq > 0 of
-        true ->
-            Purged = couch_ngen:get(SrcSt, last_purged),
-            {ok, Ptr} = couch_ngen_file:append_term(TgtSt#st.data_fd, Purged),
-            NewTgtHdr = couch_ngen_header:set(TgtHdr, [
-                {purge_seq, SrcPurgeSeq},
-                {purged_docs, Ptr}
-            ]),
-            TgtSt#st{header = NewTgtHdr};
-        false ->
-            TgtSt
-    end,
-    CompSt#comp_st{
-        tgt_st = NewTgtSt
-    }.
 
 
 copy_compact(CompSt0) ->
