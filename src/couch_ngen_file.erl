@@ -22,7 +22,8 @@
 -record(ngenfd, {
     pid,
     fd,
-    t2bopts
+    t2bopts,
+    key
 }).
 
 
@@ -32,7 +33,8 @@
     is_sys = false,
     eof = 0,
     t2bopts = [],
-    db_pid
+    db_pid,
+    key
 }).
 
 
@@ -206,7 +208,12 @@ read_term(Fd, Ptr) ->
 
 
 read_bin(#ngenfd{} = Fd, {Pos, Len}) ->
-    nifile:pread(Fd#ngenfd.fd, Len, Pos).
+    case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
+        {ok, Bin} ->
+            {ok, maybe_decrypt(Fd#ngenfd.key, Pos, Bin)};
+        Else ->
+            Else
+    end.
 
 
 truncate(Fd, Pos) ->
@@ -231,7 +238,8 @@ init({FilePath, Parent, Options}) ->
             ExtFd = #ngenfd{
                 pid = self(),
                 fd = Fd,
-                t2bopts = St#st.t2bopts
+                t2bopts = St#st.t2bopts,
+                key = St#st.key
             },
             proc_lib:init_ack({ok, ExtFd}),
             gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
@@ -289,11 +297,13 @@ handle_call({truncate, Pos}, _From, St) ->
         Error -> {reply, Error, St, ?MONITOR_CHECK}
     end;
 
-handle_call({append, Bin}, _From, St) ->
+handle_call({append, Bin0}, _From, St) ->
     #st{
-        eof = Eof
+        eof = Eof,
+        key = Key
     } = St,
 
+    Bin = maybe_encrypt(Key, Eof, Bin0),
     BinSize = size(Bin),
     case nifile:write(St#st.fd, Bin) of
         {ok, BinSize} ->
@@ -364,7 +374,8 @@ init_st(FilePath, RawFd, Parent, Options) ->
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
         t2bopts = CompressOpts ++ [{minor_version, 1}],
-        db_pid = Parent
+        db_pid = Parent,
+        key = proplists:get_value(key, Options)
     }.
 
 
@@ -389,3 +400,20 @@ is_idle(#st{}) ->
         {monitored_by, [_]} -> exit(tracker_monitoring_failed);
         _ -> false
     end.
+
+
+maybe_encrypt(undefined, _, Bin) ->
+    Bin;
+
+maybe_encrypt(Key, Pos, PlainText) ->
+    {CipherText, CipherTag} = crypto:block_encrypt(
+        aes_gcm, Key, <<Pos:96>>, {[], PlainText, 16}),
+    <<CipherTag/binary, CipherText/binary>>.
+
+
+maybe_decrypt(undefined, _, Bin) ->
+    Bin;
+
+maybe_decrypt(Key, Pos, <<CipherTag:16/binary, CipherText/binary>>) ->
+    crypto:block_decrypt(
+        aes_gcm, Key, <<Pos:96>>, {[], CipherText, CipherTag}).
