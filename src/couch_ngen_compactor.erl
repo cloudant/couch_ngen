@@ -91,7 +91,7 @@ init_compaction(SrcSt, Options1) ->
         false -> [create | Options1]
     end,
 
-    CPFd = case couch_ngen_file:open(CPPath, [raw | Options2]) of
+    CPFd = case couch_ngen_file:open(CPPath, Options2) of
         {ok, Fd0} ->
             Fd0;
         OpenCPError ->
