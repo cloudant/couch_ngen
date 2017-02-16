@@ -148,7 +148,7 @@ copy_purge_info(CompSt) ->
     SrcPurgeSeq = couch_ngen_header:purge_seq(SrcHdr),
     NewTgtSt = case SrcPurgeSeq > 0 of
         true ->
-            Purged = couch_ngen:get(SrcSt, last_purged),
+            Purged = couch_ngen:get_last_purged(SrcSt),
             {ok, Ptr} = couch_ngen_file:append_term(TgtSt#st.data_fd, Purged),
             NewTgtHdr = couch_ngen_header:set(TgtHdr, [
                 {purge_seq, SrcPurgeSeq},
@@ -169,7 +169,7 @@ copy_compact(CompSt0) ->
         tgt_st = TgtSt0
     } = CompSt0,
 
-    CompUpdateSeq = couch_ngen:get(TgtSt0, update_seq),
+    CompUpdateSeq = couch_ngen:get_update_seq(TgtSt0),
     BufferSize = get_config_int("doc_buffer_size", 524288),
     CheckpointAfter = get_config_int("checkpoint_after", BufferSize * 10),
 
@@ -197,11 +197,11 @@ copy_compact(CompSt0) ->
     } = CompSt2,
 
     % Copy the security information over
-    SecProps = couch_ngen:get(SrcSt1, security),
-    {ok, TgtSt2} = couch_ngen:set(TgtSt1, security, SecProps),
+    SecProps = couch_ngen:get_security(SrcSt1),
+    {ok, TgtSt2} = couch_ngen:copy_security(TgtSt1, SecProps),
 
-    FinalUpdateSeq = couch_ngen:get(SrcSt1, update_seq),
-    {ok, TgtSt3} = couch_ngen:set(TgtSt2, update_seq, FinalUpdateSeq),
+    FinalUpdateSeq = couch_ngen:get_update_seq(SrcSt1),
+    {ok, TgtSt3} = couch_ngen:set_update_seq(TgtSt2, FinalUpdateSeq),
 
     commit_compaction_data(CompSt2#comp_st{tgt_st = TgtSt3}).
 
@@ -215,7 +215,7 @@ enum_by_seq_fun(FDI, _Offset, {CompSt0, CAcc}) ->
         true ->
             CompSt1 = copy_docs(CompSt0, NewBatch),
             TgtSt0 = CompSt1#comp_st.tgt_st,
-            {ok, TgtSt1} = couch_ngen:set(TgtSt0, update_seq, Seq),
+            {ok, TgtSt1} = couch_ngen:set_update_seq(TgtSt0, Seq),
             CompSt2 = CompSt1#comp_st{tgt_st = TgtSt1},
             NewCAcc1 = CAcc#cacc{batch = [], curr_batch = 0},
 
@@ -244,7 +244,7 @@ copy_docs(CompSt, FDIs) ->
         A =< B
     end, FDIs),
 
-    Limit = couch_ngen:get(TgtSt, revs_limit),
+    Limit = couch_ngen:get_revs_limit(TgtSt),
 
     DocIdSeqPtrs = lists:map(fun(Info) ->
         copy_doc(CompSt, Info, Limit)
@@ -549,7 +549,7 @@ add_compact_task(CompSt, DbName) ->
         src_st = SrcSt,
         tgt_st = TgtSt
     } = CompSt,
-    NewUpdateSeq = couch_ngen:get(TgtSt, update_seq),
+    NewUpdateSeq = couch_ngen:get_update_seq(TgtSt),
     TotalChanges = couch_ngen:count_changes_since(SrcSt, NewUpdateSeq),
     TaskProps0 = [
         {type, database_compaction},

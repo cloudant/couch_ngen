@@ -28,9 +28,21 @@
     decref/1,
     monitored_by/1,
 
-    get/2,
-    get/3,
-    set/3,
+    get_compacted_seq/1,
+    get_del_doc_count/1,
+    get_disk_version/1,
+    get_doc_count/1,
+    get_epochs/1,
+    get_last_purged/1,
+    get_purge_seq/1,
+    get_revs_limit/1,
+    get_security/1,
+    get_size_info/1,
+    get_update_seq/1,
+    get_uuid/1,
+
+    set_revs_limit/2,
+    set_security/2,
 
     open_docs/2,
     open_local_docs/2,
@@ -78,6 +90,11 @@
     local_tree_join/3
 ]).
 
+% Used by the compactor
+-export([
+    set_update_seq/2,
+    copy_security/2
+]).
 
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_ngen.hrl").
@@ -175,28 +192,53 @@ monitored_by(St) ->
     end, [], [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]).
 
 
-get(#st{} = St, DbProp) ->
-    ?MODULE:get(St, DbProp, undefined).
+get_compacted_seq(#st{header = Header}) ->
+    couch_ngen_header:get(Header, compacted_seq).
 
 
-get(#st{} = St, last_purged, _) ->
-    case ?MODULE:get(St, purged_docs, nil) of
+get_del_doc_count(#st{} = St) ->
+    {ok, {_, DelCount, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
+    DelCount.
+
+
+get_disk_version(#st{header = Header}) ->
+    couch_ngen_header:get(Header, disk_version).
+
+
+get_doc_count(#st{} = St) ->
+    {ok, {Count, _, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
+    Count.
+
+
+get_epochs(#st{header = Header}) ->
+    couch_ngen_header:get(Header, epochs).
+
+
+get_last_purged(#st{header = Header} = St) ->
+    case couch_ngen_header:get(Header, purged_docs, nil) of
         nil ->
             [];
         Pointer ->
             {ok, Purged} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
             Purged
-    end;
+    end.
 
-get(#st{} = St, doc_count, _) ->
-    {ok, {Count, _, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
-    Count;
 
-get(#st{} = St, del_doc_count, _) ->
-    {ok, {_, DelCount, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
-    DelCount;
+get_purge_seq(#st{header = Header}) ->
+    couch_ngen_header:get(Header, purge_seq).
 
-get(#st{} = St, size_info, _) ->
+
+get_revs_limit(#st{header = Header}) ->
+    couch_ngen_header:get(Header, revs_limit).
+
+
+get_security(#st{header = Header} = St) ->
+    Pointer = couch_ngen_header:get(Header, security_ptr),
+    {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
+    SecProps.
+
+
+get_size_info(#st{} = St) ->
     {ok, IdxSize} = couch_ngen_file:bytes(St#st.idx_fd),
     {ok, DataSize} = couch_ngen_file:bytes(St#st.data_fd),
     FileSize = IdxSize + DataSize,
@@ -217,55 +259,36 @@ get(#st{} = St, size_info, _) ->
         {active, ActiveSize},
         {external, ExternalSize},
         {file, FileSize}
-    ];
-
-get(#st{} = St, security, _) ->
-    Pointer = ?MODULE:get(St, security_ptr, undefined),
-    {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
-    SecProps;
-
-get(#st{header = Header}, DbProp, Default) ->
-    couch_ngen_header:get(Header, DbProp, Default).
+    ].
 
 
-set(#st{} = St, security, NewSecurity) ->
+get_update_seq(#st{header = Header}) ->
+    couch_ngen_header:get(Header, update_seq).
+
+
+get_uuid(#st{header = Header}) ->
+    couch_ngen_header:get(Header, uuid).
+
+
+set_revs_limit(#st{header = Header} = St, RevsLimit) ->
+    NewSt = St#st{
+        header = couch_ngen_header:set(Header, [
+            {revs_limit, RevsLimit}
+        ]),
+        needs_commit = true
+    },
+    {ok, increment_update_seq(NewSt)}.
+
+
+set_security(#st{header = Header} = St, NewSecurity) ->
     {ok, Ptr} = couch_ngen_file:append_term(St#st.data_fd, NewSecurity),
-    set(St, security_ptr, Ptr);
-
-set(#st{} = St, update_seq, Value) ->
-    #st{
-        header = Header
-    } = St,
-    {ok, St#st{
-        header = couch_ngen_header:set(Header, [
-            {update_seq, Value}
+    NewSt = St#st{
+        header = couch_bt_engine_header:set(Header, [
+            {security_ptr, Ptr}
         ]),
         needs_commit = true
-    }};
-
-set(#st{} = St, compacted_seq, Value) ->
-    #st{
-        header = Header
-    } = St,
-    {ok, St#st{
-        header = couch_ngen_header:set(Header, [
-            {compacted_seq, Value}
-        ]),
-        needs_commit = true
-    }};
-
-set(#st{} = St, DbProp, Value) ->
-    #st{
-        header = Header
-    } = St,
-    UpdateSeq = couch_ngen_header:get(Header, update_seq),
-    {ok, St#st{
-        header = couch_ngen_header:set(Header, [
-            {DbProp, Value},
-            {update_seq, UpdateSeq + 1}
-        ]),
-        needs_commit = true
-    }}.
+    },
+    {ok, increment_update_seq(NewSt)}.
 
 
 open_docs(#st{} = St, DocIds) ->
@@ -458,8 +481,8 @@ start_compaction(St, DbName, Options, Parent) ->
 
 finish_compaction(SrcSt, DbName, Options, DirPath) ->
     {ok, TgtSt1} = ?MODULE:init(DirPath, [compactor | Options]),
-    SrcSeq = ?MODULE:get(SrcSt, update_seq),
-    TgtSeq = ?MODULE:get(TgtSt1, update_seq),
+    SrcSeq = get_update_seq(SrcSt),
+    TgtSeq = get_update_seq(TgtSt1),
     case SrcSeq == TgtSeq of
         true ->
             finish_compaction_int(SrcSt, TgtSt1);
@@ -530,6 +553,25 @@ local_tree_join(Id, Ptr, DataFd) ->
         revs = {0, [Rev]},
         body = BodyData
     }.
+
+
+set_update_seq(#st{header = Header} = St, UpdateSeq) ->
+    {ok, St#st{
+        header = couch_ngen_header:set(Header, [
+            {update_seq, UpdateSeq}
+        ]),
+        needs_commit = true
+    }}.
+
+
+copy_security(#st{header = Header} = St, SecProps) ->
+    {ok, Ptr} = couch_ngen_file:append_term(St#st.data_fd, SecProps),
+    {ok, St#st{
+        header = couch_ngen_header:set(Header, [
+            {security_ptr, Ptr}
+        ]),
+        needs_commit = true
+    }}.
 
 
 read_header(CPFd, IdxFd) ->
@@ -705,6 +747,15 @@ update_header(St, Header) ->
     ]).
 
 
+increment_update_seq(#st{header = Header} = St) ->
+    UpdateSeq = couch_ngen_header:get(Header, update_seq),
+    St#st{
+        header = couch_ngen_header:set(Header, [
+            {update_seq, UpdateSeq + 1}
+        ])
+    }.
+
+
 set_default_security_object(Fd, Header, Options) ->
     case couch_ngen_header:get(Header, security_ptr) of
         Pointer when is_tuple(Pointer) ->
@@ -722,7 +773,7 @@ delete_compaction_files(DirPath) ->
 
 
 get_write_info(St, Pairs) ->
-    Acc = #wiacc{update_seq = ?MODULE:get(St, update_seq)},
+    Acc = #wiacc{update_seq = get_update_seq(St)},
     get_write_info(St, Pairs, Acc).
 
 
@@ -933,8 +984,8 @@ finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
 
     {ok, NewSt2} = commit_data(NewSt1#st{
         header = couch_bt_engine_header:set(Header, [
-            {compacted_seq, ?MODULE:get(OldSt, update_seq)},
-            {revs_limit, ?MODULE:get(OldSt, revs_limit)}
+            {compacted_seq, get_update_seq(OldSt)},
+            {revs_limit, get_revs_limit(OldSt)}
         ]),
         local_tree = NewLocal2
     }),
