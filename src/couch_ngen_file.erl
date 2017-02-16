@@ -307,7 +307,8 @@ handle_call({append, Bin}, _From, St) ->
             },
             {reply, {error, incomplete_write}, NewSt, ?MONITOR_CHECK};
         Error ->
-            {reply, Error, St, ?MONITOR_CHECK}
+            {ok, Eof} = nifile:seek(St#st.fd, 0, seek_end),
+            {reply, Error, St#st{eof = Eof}, ?MONITOR_CHECK}
     end.
 
 
