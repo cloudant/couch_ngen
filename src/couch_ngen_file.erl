@@ -22,9 +22,8 @@
 -record(ngenfd, {
     pid,
     fd,
-    raw = false,
     t2bopts,
-    hash
+    mode
 }).
 
 
@@ -34,7 +33,8 @@
     is_sys = false,
     eof = 0,
     t2bopts = [],
-    db_pid
+    db_pid,
+    mode
 }).
 
 
@@ -198,26 +198,12 @@ append_term(#ngenfd{} = Fd, Term) ->
 append_bin(Fd, Bin) when is_list(Bin) ->
     append_bin(Fd, iolist_to_binary(Bin));
 
-append_bin(#ngenfd{raw = true} = Fd, Bin) ->
+append_bin(#ngenfd{mode = raw} = Fd, Bin) ->
     gen_server:call(Fd#ngenfd.pid, {append, Bin});
 
-append_bin(#ngenfd{hash = undefined} = Fd, Bin) ->
-    gen_server:call(Fd#ngenfd.pid, {append, <<0, Bin/binary>>});
-
-append_bin(Fd, Bin) when is_binary(Bin) ->
-    NameBin = list_to_binary(atom_to_list(Fd#ngenfd.hash)),
-    ValueBin = hash(Bin, Fd#ngenfd.hash),
-    NameSize = size(NameBin),
-    ValueSize = size(ValueBin),
-    true = NameSize < 256 andalso ValueSize < 256,
-    FileBin = <<
-            NameSize:8,
-            ValueSize:8,
-            NameBin/binary,
-            ValueBin/binary,
-            Bin/binary
-        >>,
-    gen_server:call(Fd#ngenfd.pid, {append, FileBin}).
+append_bin(#ngenfd{mode = crc32} = Fd, Bin) when is_binary(Bin) ->
+    Crc32 = erlang:crc32(Bin),
+    gen_server:call(Fd#ngenfd.pid, {append, <<Crc32:32/integer, Bin/binary>>}).
 
 
 read_term(Fd, Ptr) ->
@@ -225,15 +211,20 @@ read_term(Fd, Ptr) ->
     {ok, binary_to_term(Bin)}.
 
 
-read_bin(#ngenfd{raw = true} = Fd, {Pos, Len}) ->
+read_bin(#ngenfd{mode = raw} = Fd, {Pos, Len}) ->
     nifile:pread(Fd#ngenfd.fd, Len, Pos);
 
-read_bin(Fd, {Pos, Len}) ->
+read_bin(#ngenfd{mode = crc32} = Fd, {Pos, Len}) ->
     case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
-        {ok, <<0, Value/binary>>} ->
-            {ok, Value};
-        {ok, HashBin} ->
-            verify(HashBin)
+        {ok, <<Crc32:32/integer, Bin/binary>>} ->
+            case erlang:crc32(Bin) of
+                Crc32 ->
+                    {ok, Bin};
+                _Other ->
+                    {error, crc32_failed}
+            end;
+        Else ->
+            Else
     end.
 
 
@@ -259,9 +250,8 @@ init({FilePath, Parent, Options}) ->
             ExtFd = #ngenfd{
                 pid = self(),
                 fd = Fd,
-                raw = lists:member(raw, Options),
                 t2bopts = St#st.t2bopts,
-                hash = proplists:get_value(hash, Options)
+                mode = St#st.mode
             },
             proc_lib:init_ack({ok, ExtFd}),
             gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
@@ -396,7 +386,8 @@ init_st(FilePath, RawFd, Parent, Options) ->
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
         t2bopts = CompressOpts ++ [{minor_version, 1}],
-        db_pid = Parent
+        db_pid = Parent,
+        mode = proplists:get_value(mode, Options, crc32)
     }.
 
 
@@ -420,27 +411,4 @@ is_idle(#st{}) ->
         {monitored_by, [Tracker]} -> true;
         {monitored_by, [_]} -> exit(tracker_monitoring_failed);
         _ -> false
-    end.
-
-
-hash(Bin, Name) ->
-    case Name of
-        adler32 -> hbin(erlang:adler32(Bin));
-        crc32 -> hbin(erlang:crc32(Bin));
-        phash2 -> hbin(erlang:phash2(Bin));
-        HashName -> crypto:hash(HashName, Bin)
-    end.
-
-
-hbin(Val) when is_integer(Val), Val >= 0, Val < 16#100000000 ->
-    <<Val:32/integer>>.
-
-
-verify(Bin) when is_binary(Bin), size(Bin) > 2 ->
-    <<NameSize:8, ValueSize:8, Rest/binary>> = Bin,
-    <<NameBin:NameSize/binary, Value:ValueSize/binary, Data/binary>> = Rest,
-    Name = list_to_atom(binary_to_list(NameBin)),
-    case hash(Data, Name) of
-        Value -> {ok, Data};
-        OtherValue -> {error, {hash_mismatch, Value, OtherValue}}
     end.
