@@ -198,12 +198,13 @@ append_term(#ngenfd{} = Fd, Term) ->
 append_bin(Fd, Bin) when is_list(Bin) ->
     append_bin(Fd, iolist_to_binary(Bin));
 
-append_bin(#ngenfd{mode = raw} = Fd, Bin) ->
-    gen_server:call(Fd#ngenfd.pid, {append, Bin});
-
 append_bin(#ngenfd{mode = crc32} = Fd, Bin) when is_binary(Bin) ->
     Crc32 = erlang:crc32(Bin),
-    gen_server:call(Fd#ngenfd.pid, {append, <<Crc32:32/integer, Bin/binary>>}).
+    gen_server:call(Fd#ngenfd.pid,
+        {append, <<Crc32:32/integer, Bin/binary>>});
+
+append_bin(#ngenfd{} = Fd, Bin) ->
+    gen_server:call(Fd#ngenfd.pid, {append, Bin}).
 
 
 read_term(Fd, Ptr) ->
@@ -223,8 +224,21 @@ read_bin(#ngenfd{mode = crc32} = Fd, {Pos, Len}) ->
                 _Other ->
                     {error, crc32_failed}
             end;
-        Else ->
-            Else
+        {error, Reason} ->
+            {error, Reason}
+    end;
+
+read_bin(#ngenfd{mode = {gcm, Key}} = Fd, {Pos, Len}) ->
+    case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
+        {ok, Bin} ->
+            case gcm_decrypt(Key, Pos, Bin) of
+                error ->
+                    {error, decryption_failed};
+                PlainText ->
+                    {ok, PlainText}
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 
@@ -309,11 +323,12 @@ handle_call({truncate, Pos}, _From, St) ->
         Error -> {reply, Error, St, ?MONITOR_CHECK}
     end;
 
-handle_call({append, Bin}, _From, St) ->
+handle_call({append, Bin0}, _From, St) ->
     #st{
         eof = Eof
     } = St,
 
+    Bin = maybe_encrypt(St, Bin0),
     BinSize = size(Bin),
     case nifile:write(St#st.fd, Bin) of
         {ok, BinSize} ->
@@ -412,3 +427,23 @@ is_idle(#st{}) ->
         {monitored_by, [_]} -> exit(tracker_monitoring_failed);
         _ -> false
     end.
+
+
+maybe_encrypt(#st{mode = {gcm, Key}} = St, Bin) ->
+    gcm_encrypt(Key, St#st.eof, Bin);
+
+maybe_encrypt(#st{}, Bin) ->
+    Bin.
+
+
+gcm_encrypt(Key, Pos, PlainText)
+  when Pos >= 0, Pos =< 16#1000000000000000000000000 ->
+    {CipherText, CipherTag} = crypto:block_encrypt(
+       aes_gcm, Key, <<Pos:96>>, {<<>>, PlainText, 16}),
+    <<CipherTag:16/binary, CipherText/binary>>.
+
+
+gcm_decrypt(Key, Pos, <<CipherTag:16/binary, CipherText/binary>>)
+  when Pos >= 0, Pos =< 16#1000000000000000000000000 ->
+    crypto:block_decrypt(
+        aes_gcm, Key, <<Pos:96>>, {<<>>, CipherText, CipherTag}).
