@@ -395,15 +395,31 @@ init_st(FilePath, RawFd, Parent, Options) ->
             []
     end,
     {ok, Bytes} = nifile:seek(RawFd, 0, seek_end),
-    #st{
+    init_gcm(#st{
         path = iolist_to_binary(FilePath),
         fd = RawFd,
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
         t2bopts = CompressOpts ++ [{minor_version, 1}],
         db_pid = Parent,
-        mode = proplists:get_value(mode, Options, crc32)
-    }.
+        mode = proplists:get_value(mode, Options)
+    }).
+
+
+init_gcm(#st{eof = 0, mode = {gcm, Key}} = St) ->
+    FileKey = crypto:strong_rand_bytes(32),
+    WrappedKey = rfc3394:wrap(Key, FileKey),
+    {ok, 40} = nifile:write(St#st.fd, WrappedKey),
+    ok = nifile:sync(St#st.fd),
+    St#st{eof = 40, mode = {gcm, FileKey}};
+
+init_gcm(#st{mode = {gcm, Key}} = St) ->
+    {ok, <<WrappedKey:40/binary>>} = nifile:pread(St#st.fd, 40, 0),
+    FileKey = rfc3394:unwrap(Key, WrappedKey),
+    St#st{mode = {gcm, FileKey}};
+
+init_gcm(#st{} = St) ->
+    St.
 
 
 maybe_track(Options) ->

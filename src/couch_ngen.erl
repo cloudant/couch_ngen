@@ -610,7 +610,15 @@ write_header(CPFd, IdxFd, Header) ->
     ok.
 
 
-open_db_files(DirPath, Options) ->
+open_db_files(DirPath, Options0) ->
+    % remove mode so we don't apply it to the COMMITS file.
+    {Mode, Options} = case lists:keytake(mode, 1, Options0) of
+        false ->
+            {crc32, Options0};
+        {value, {mode, Mode1}, Options1} ->
+            {Mode1, Options1}
+    end,
+
     CPPath = db_filepath(DirPath, "COMMITS", "", Options),
     case lists:member(create, Options) of
         true -> filelib:ensure_dir(CPPath);
@@ -618,7 +626,7 @@ open_db_files(DirPath, Options) ->
     end,
     case couch_ngen_file:open(CPPath, [{mode, raw} | Options]) of
         {ok, Fd} ->
-            open_idx_data_files(DirPath, Fd, Options);
+            open_idx_data_files(DirPath, Fd, [{mode, Mode} | Options]);
         {error, enoent} ->
             % If we're recovering from a COMMITS.compact we
             % only treat that as valid if we've already
@@ -641,11 +649,9 @@ open_db_files(DirPath, Options) ->
 
 
 open_idx_data_files(DirPath, CPFd, Options) ->
-    % TODO: Grab this from the config
-    HashOpt = {hash, crc32},
     {ok, IdxPath, DataPath} = get_file_paths(DirPath, CPFd, Options),
-    {ok, IdxFd} = couch_ngen_file:open(IdxPath, [HashOpt | Options]),
-    {ok, DataFd} = couch_ngen_file:open(DataPath, [HashOpt | Options]),
+    {ok, IdxFd} = couch_ngen_file:open(IdxPath, Options),
+    {ok, DataFd} = couch_ngen_file:open(DataPath, Options),
     {ok, CPFd, IdxFd, DataFd}.
 
 
