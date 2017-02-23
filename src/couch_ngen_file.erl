@@ -260,15 +260,19 @@ init({FilePath, Parent, Options}) ->
 
     case nifile:open(FilePath, OpenOpts) of
         {ok, Fd} ->
-            St = init_st(FilePath, Fd, Parent, Options),
-            ExtFd = #ngenfd{
-                pid = self(),
-                fd = Fd,
-                t2bopts = St#st.t2bopts,
-                mode = St#st.mode
-            },
-            proc_lib:init_ack({ok, ExtFd}),
-            gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
+            case init_st(FilePath, Fd, Parent, Options) of
+                #st{} = St ->
+                    ExtFd = #ngenfd{
+                        pid = self(),
+                        fd = Fd,
+                        t2bopts = St#st.t2bopts,
+                        mode = St#st.mode
+                    },
+                    proc_lib:init_ack({ok, ExtFd}),
+                    gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
+                Error ->
+                    proc_lib:init_ack(Error)
+            end;
         Error ->
             proc_lib:init_ack(Error)
     end.
@@ -406,17 +410,28 @@ init_st(FilePath, RawFd, Parent, Options) ->
     }).
 
 
-init_gcm(#st{eof = 0, mode = {gcm, Key}} = St) ->
-    FileKey = crypto:strong_rand_bytes(32),
-    WrappedKey = rfc3394:wrap(Key, FileKey),
-    {ok, 40} = nifile:write(St#st.fd, WrappedKey),
+init_gcm(#st{eof = 0, mode = {gcm, Key}} = St)
+  when bit_size(Key) == 256; bit_size(Key) == 512 ->
+    %% SIV uses half the master key bits to wrap the data
+    %% so there's no point making the file key longer than that.
+    FileKey = crypto:strong_rand_bytes(byte_size(Key) div 2),
+    {CipherText, CipherTag} = siv:encrypt(Key, [], FileKey),
+    Bin = <<CipherText/binary, CipherTag/binary>>,
+    {ok, Size} = nifile:write(St#st.fd, Bin),
     ok = nifile:sync(St#st.fd),
-    St#st{eof = 40, mode = {gcm, FileKey}};
+    St#st{eof = Size, mode = {gcm, FileKey}};
 
-init_gcm(#st{mode = {gcm, Key}} = St) ->
-    {ok, <<WrappedKey:40/binary>>} = nifile:pread(St#st.fd, 40, 0),
-    FileKey = rfc3394:unwrap(Key, WrappedKey),
-    St#st{mode = {gcm, FileKey}};
+init_gcm(#st{mode = {gcm, Key}} = St)
+  when bit_size(Key) == 256; bit_size(Key) == 512 ->
+    KeySize = byte_size(Key) div 2,
+    {ok, <<CipherText:KeySize/binary, CipherTag:16/binary>>} =
+        nifile:pread(St#st.fd, KeySize + 16, 0),
+    case siv:decrypt(Key, [], {CipherText, CipherTag}) of
+        error ->
+            {error, decryption_failed};
+        FileKey ->
+            St#st{mode = {gcm, FileKey}}
+    end;
 
 init_gcm(#st{} = St) ->
     St.
