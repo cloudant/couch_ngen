@@ -10,14 +10,18 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
-{application, couch_ngen, [
-    {description, "Apache CouchDB storage engine based on nifile"},
-    {vsn, git},
-    {applications, [
-        kernel,
-        stdlib,
-        nifile,
-        couch
-    ]},
-    {mod, {couch_ngen_app, []}}
-]}.
+-module(couch_ngen_sup).
+
+-behaviour(supervisor).
+
+-export([start_link/0, init/1]).
+
+-define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+
+init(_) ->
+    Children = [?CHILD(couch_ngen_keycache, worker)],
+    {ok, {{one_for_one,10,1}, Children}}.

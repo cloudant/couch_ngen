@@ -10,14 +10,15 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
-{application, couch_ngen, [
-    {description, "Apache CouchDB storage engine based on nifile"},
-    {vsn, git},
-    {applications, [
-        kernel,
-        stdlib,
-        nifile,
-        couch
-    ]},
-    {mod, {couch_ngen_app, []}}
-]}.
+-module(couch_ngen_app).
+
+-behaviour(application).
+
+-export([start/2, stop/1]).
+
+start(_Type, _) ->
+    couch_ngen_sup:start_link().
+
+
+stop(_) ->
+    ok.
