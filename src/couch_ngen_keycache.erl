@@ -44,7 +44,11 @@ init(_) ->
 handle_call({get_key, Name}, _From, St) ->
     case ets:lookup(St#st.tab, Name) of
         [] ->
-            {reply, {error, not_found}, St};
+            %% obviously just for demonstration
+            Key = crypto:hash(sha256, Name),
+            true = ets:insert_new(St#st.tab, [{Name, Key}]),
+            {reply, {ok, Key}, St};
+            %% {reply, {error, not_found}, St};
         [{Name, Key}] ->
             {reply, {ok, Key}, St}
     end;
@@ -60,8 +64,10 @@ handle_cast(_Msg, St) ->
 handle_info(_Msg, St) ->
     {noreply, St}.
 
+
 terminate(_Reason, _State) ->
     ok.
+
 
 code_change(_OldVsn, nil, _Extra) ->
     {ok, nil}.

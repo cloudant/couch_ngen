@@ -23,7 +23,7 @@
     pid,
     fd,
     t2bopts,
-    mode
+    mode :: raw | crc32 | {gcm, binary()}
 }).
 
 
@@ -34,7 +34,7 @@
     eof = 0,
     t2bopts = [],
     db_pid,
-    mode
+    mode :: raw | crc32 | {gcm, binary()}
 }).
 
 
@@ -261,7 +261,7 @@ init({FilePath, Parent, Options}) ->
     case nifile:open(FilePath, OpenOpts) of
         {ok, Fd} ->
             case init_st(FilePath, Fd, Parent, Options) of
-                #st{} = St ->
+                {ok, #st{} = St} ->
                     ExtFd = #ngenfd{
                         pid = self(),
                         fd = Fd,
@@ -270,11 +270,11 @@ init({FilePath, Parent, Options}) ->
                     },
                     proc_lib:init_ack({ok, ExtFd}),
                     gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
-                Error ->
-                    proc_lib:init_ack(Error)
+                {error, Reason} ->
+                    proc_lib:init_ack({error, Reason})
             end;
-        Error ->
-            proc_lib:init_ack(Error)
+        {error, Reason} ->
+            proc_lib:init_ack({error, Reason})
     end.
 
 
@@ -399,42 +399,79 @@ init_st(FilePath, RawFd, Parent, Options) ->
             []
     end,
     {ok, Bytes} = nifile:seek(RawFd, 0, seek_end),
-    init_gcm(#st{
+    init_mode(#st{
         path = iolist_to_binary(FilePath),
         fd = RawFd,
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
         t2bopts = CompressOpts ++ [{minor_version, 1}],
-        db_pid = Parent,
-        mode = proplists:get_value(mode, Options)
-    }).
+        db_pid = Parent
+    }, Options).
+
+init_mode(#st{} = St, Options) ->
+    Raw = lists:member(raw, Options),
+    Creating = lists:member(create, Options),
+    Empty = St#st.eof == 0,
+    HasKeyIdOpt = keyid(Options) /= undefined,
+
+    case {Raw, Creating, Empty, HasKeyIdOpt} of
+        {true, _, _, _} ->
+            {ok, St#st{mode = raw}};
+        {false, true, true, false} ->
+            {ok, Size} = nifile:write(St#st.fd, <<"crc32">>),
+            ok = nifile:sync(St#st.fd),
+            {ok, St#st{eof = Size, mode = crc32}};
+        {false, true, true, true} ->
+            KeyId = keyid(Options),
+            case couch_ngen_keycache:get_key(KeyId) of
+                {ok, MasterKey} ->
+                    %% SIV uses half the master key bits to wrap the data
+                    %% so there's no point making the file key longer than that.
+                    FileKey = crypto:strong_rand_bytes(byte_size(MasterKey) div 2),
+                    {CipherText, CipherTag} = siv:encrypt(MasterKey, [KeyId], FileKey),
+                    Bin = <<$g, $c, $m,
+                            (byte_size(KeyId)):16,
+                            KeyId/binary,
+                            CipherText/binary,
+                            CipherTag/binary>>,
+                    {ok, Size} = nifile:write(St#st.fd, Bin),
+                    ok = nifile:sync(St#st.fd),
+                    {ok, St#st{eof = Size, mode = {gcm, FileKey}}};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {false, false, false, _} ->
+            case nifile:pread(St#st.fd, 5, 0) of
+                {ok, <<"crc32">>} ->
+                    {ok, St#st{mode = crc32}};
+                {ok, <<"gcm", KeyIdSize:16>>} ->
+                    {ok, KeyId} = nifile:pread(St#st.fd, KeyIdSize, 5),
+                    case couch_ngen_keycache:get_key(KeyId) of
+                        {ok, MasterKey} ->
+                            KeySize = byte_size(MasterKey) div 2,
+                            {ok, <<CipherText:KeySize/binary,
+                                   CipherTag:16/binary>>} =
+                                nifile:pread(St#st.fd, KeySize + 16, 5 + KeyIdSize),
+                            case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
+                                error ->
+                                    {error, decryption_failed};
+                                FileKey ->
+                                    {ok, St#st{mode = {gcm, FileKey}}}
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        _Else ->
+            {error, invalid_file}
+    end.
 
 
-init_gcm(#st{eof = 0, mode = {gcm, Key}} = St)
-  when bit_size(Key) == 256; bit_size(Key) == 512 ->
-    %% SIV uses half the master key bits to wrap the data
-    %% so there's no point making the file key longer than that.
-    FileKey = crypto:strong_rand_bytes(byte_size(Key) div 2),
-    {CipherText, CipherTag} = siv:encrypt(Key, [], FileKey),
-    Bin = <<CipherText/binary, CipherTag/binary>>,
-    {ok, Size} = nifile:write(St#st.fd, Bin),
-    ok = nifile:sync(St#st.fd),
-    St#st{eof = Size, mode = {gcm, FileKey}};
-
-init_gcm(#st{mode = {gcm, Key}} = St)
-  when bit_size(Key) == 256; bit_size(Key) == 512 ->
-    KeySize = byte_size(Key) div 2,
-    {ok, <<CipherText:KeySize/binary, CipherTag:16/binary>>} =
-        nifile:pread(St#st.fd, KeySize + 16, 0),
-    case siv:decrypt(Key, [], {CipherText, CipherTag}) of
-        error ->
-            {error, decryption_failed};
-        FileKey ->
-            St#st{mode = {gcm, FileKey}}
-    end;
-
-init_gcm(#st{} = St) ->
-    St.
+keyid(Options) when is_list(Options) ->
+    {EngineOptions} = proplists:get_value(engine_options, Options, {[]}),
+    proplists:get_value(<<"keyid">>, EngineOptions).
 
 
 maybe_track(Options) ->

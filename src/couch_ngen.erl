@@ -610,30 +610,22 @@ write_header(CPFd, IdxFd, Header) ->
     ok.
 
 
-open_db_files(DirPath, Options0) ->
-    % remove mode so we don't apply it to the COMMITS file.
-    {Mode, Options} = case lists:keytake(mode, 1, Options0) of
-        false ->
-            {crc32, Options0};
-        {value, {mode, Mode1}, Options1} ->
-            {Mode1, Options1}
-    end,
-
+open_db_files(DirPath, Options) ->
     CPPath = db_filepath(DirPath, "COMMITS", "", Options),
     case lists:member(create, Options) of
         true -> filelib:ensure_dir(CPPath);
         false -> ok
     end,
-    case couch_ngen_file:open(CPPath, [{mode, raw} | Options]) of
+    case couch_ngen_file:open(CPPath, [raw | Options]) of
         {ok, Fd} ->
-            open_idx_data_files(DirPath, Fd, [{mode, Mode} | Options]);
+            open_idx_data_files(DirPath, Fd, Options);
         {error, enoent} ->
             % If we're recovering from a COMMITS.compact we
             % only treat that as valid if we've already
             % moved the index and data files or else compaction
             % wasn't finished. Hence why we're not renaming them
             % here.
-            case couch_ngen_file:open(CPPath ++ ".compact", [{mode, raw}]) of
+            case couch_ngen_file:open(CPPath ++ ".compact", [raw]) of
                 {ok, Fd} ->
                     Fmt = "Recovering from compaction file: ~s~s",
                     couch_log:info(Fmt, [CPPath, ".compact"]),
@@ -650,9 +642,17 @@ open_db_files(DirPath, Options0) ->
 
 open_idx_data_files(DirPath, CPFd, Options) ->
     {ok, IdxPath, DataPath} = get_file_paths(DirPath, CPFd, Options),
-    {ok, IdxFd} = couch_ngen_file:open(IdxPath, Options),
-    {ok, DataFd} = couch_ngen_file:open(DataPath, Options),
-    {ok, CPFd, IdxFd, DataFd}.
+    case couch_ngen_file:open(IdxPath, Options) of
+        {ok, IdxFd} ->
+            case couch_ngen_file:open(DataPath, Options) of
+                {ok, DataFd} ->
+                    {ok, CPFd, IdxFd, DataFd};
+                Else ->
+                    Else
+            end;
+        Else ->
+            Else
+    end.
 
 
 get_file_paths(DirPath, CPFd, Options) ->
@@ -1038,4 +1038,3 @@ db_filepath(DirPath, BaseName0, Suffix, Options) ->
         false ->
             filename:join(DirPath, BaseName2)
     end.
-
