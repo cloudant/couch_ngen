@@ -416,56 +416,80 @@ init_mode(#st{} = St, Options) ->
 
     case {Raw, Creating, Empty, HasKeyIdOpt} of
         {true, _, _, _} ->
-            {ok, St#st{mode = raw}};
+            set_raw_mode(St);
         {false, true, true, false} ->
-            {ok, Size} = nifile:write(St#st.fd, <<"crc32">>),
-            ok = nifile:sync(St#st.fd),
-            {ok, St#st{eof = Size, mode = crc32}};
+            init_crc32_mode(St);
         {false, true, true, true} ->
-            KeyId = keyid(Options),
-            case couch_ngen_keycache:get_key(KeyId) of
-                {ok, MasterKey} ->
-                    %% SIV uses half the master key bits to wrap the data
-                    %% so there's no point making the file key longer than that.
-                    FileKey = crypto:strong_rand_bytes(byte_size(MasterKey) div 2),
-                    {CipherText, CipherTag} = siv:encrypt(MasterKey, [KeyId], FileKey),
-                    Bin = <<$g, $c, $m,
-                            (byte_size(KeyId)):16,
-                            KeyId/binary,
-                            CipherText/binary,
-                            CipherTag/binary>>,
-                    {ok, Size} = nifile:write(St#st.fd, Bin),
-                    ok = nifile:sync(St#st.fd),
-                    {ok, St#st{eof = Size, mode = {gcm, FileKey}}};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            init_gcm_mode(St, Options);
         {false, false, false, _} ->
-            case nifile:pread(St#st.fd, 5, 0) of
+            case get_mode(St) of
                 {ok, <<"crc32">>} ->
-                    {ok, St#st{mode = crc32}};
+                    set_crc32_mode(St);
                 {ok, <<"gcm", KeyIdSize:16>>} ->
-                    {ok, KeyId} = nifile:pread(St#st.fd, KeyIdSize, 5),
-                    case couch_ngen_keycache:get_key(KeyId) of
-                        {ok, MasterKey} ->
-                            KeySize = byte_size(MasterKey) div 2,
-                            {ok, <<CipherText:KeySize/binary,
-                                   CipherTag:16/binary>>} =
-                                nifile:pread(St#st.fd, KeySize + 16, 5 + KeyIdSize),
-                            case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
-                                error ->
-                                    {error, decryption_failed};
-                                FileKey ->
-                                    {ok, St#st{mode = {gcm, FileKey}}}
-                            end;
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
+                    set_gcm_mode(St, KeyIdSize);
                 {error, Reason} ->
                     {error, Reason}
             end;
         _Else ->
             {error, invalid_file}
+    end.
+
+
+get_mode(St) ->
+    nifile:pread(St#st.fd, 5, 0).
+
+
+set_raw_mode(St) ->
+    {ok, St#st{mode = raw}}.
+
+
+init_crc32_mode(#st{eof = 0} = St) ->
+    {ok, Size} = nifile:write(St#st.fd, <<"crc32">>),
+    ok = nifile:sync(St#st.fd),
+    set_crc32_mode(St#st{eof = Size}).
+
+set_crc32_mode(St) ->
+    {ok, St#st{mode = crc32}}.
+
+
+init_gcm_mode(St, Options) ->
+    KeyId = keyid(Options),
+    KeyIdSize = byte_size(KeyId),
+
+    case couch_ngen_keycache:get_key(KeyId) of
+        {ok, MasterKey} ->
+            %% SIV uses half the master key bits to wrap the data
+            %% so there's no point making the file key longer than that.
+            FileKey = crypto:strong_rand_bytes(byte_size(MasterKey) div 2),
+            {CipherText, CipherTag} = siv:encrypt(MasterKey, [KeyId], FileKey),
+            Bin = <<$g, $c, $m,
+                    KeyIdSize:16,
+                    KeyId/binary,
+                    CipherText/binary,
+                    CipherTag/binary>>,
+            {ok, Size} = nifile:write(St#st.fd, Bin),
+            ok = nifile:sync(St#st.fd),
+            set_gcm_mode(St#st{eof = Size}, KeyIdSize);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+
+set_gcm_mode(St, KeyIdSize) ->
+    {ok, KeyId} = nifile:pread(St#st.fd, KeyIdSize, 5),
+    case couch_ngen_keycache:get_key(KeyId) of
+        {ok, MasterKey} ->
+            KeySize = byte_size(MasterKey) div 2,
+            {ok, <<CipherText:KeySize/binary, CipherTag:16/binary>>} =
+                nifile:pread(St#st.fd, KeySize + 16, 5 + KeyIdSize),
+            case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
+                error ->
+                    {error, decryption_failed};
+                FileKey ->
+                    {ok, St#st{mode = {gcm, FileKey}}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 
