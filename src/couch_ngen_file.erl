@@ -38,6 +38,9 @@
 }).
 
 
+-include_lib("kernel/include/file.hrl").
+
+
 -export([
     init_delete_dir/1,
     delete/2,
@@ -411,22 +414,21 @@ init_st(FilePath, RawFd, Parent, Options) ->
 init_mode(#st{} = St, Options) ->
     Raw = lists:member(raw, Options),
     Creating = lists:member(create, Options),
-    Empty = St#st.eof == 0,
     HasKeyIdOpt = keyid(Options) /= undefined,
 
-    case {Raw, Creating, Empty, HasKeyIdOpt} of
-        {true, _, _, _} ->
+    case {Raw, Creating, HasKeyIdOpt} of
+        {true, _, _} ->
             set_raw_mode(St);
-        {false, true, true, false} ->
+        {false, true, false} ->
             init_crc32_mode(St);
-        {false, true, true, true} ->
+        {false, true, true} ->
             init_gcm_mode(St, Options);
-        {false, false, false, _} ->
+        {false, false, _} ->
             case get_mode(St) of
-                {ok, <<"crc32">>} ->
+                {ok, <<"crc32", _/binary>>} ->
                     set_crc32_mode(St);
-                {ok, <<"gcm", KeyIdSize:16>>} ->
-                    set_gcm_mode(St, KeyIdSize);
+                {ok, <<"gcm", _/binary>> = Mode} ->
+                    set_gcm_mode(St, Mode);
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -436,23 +438,28 @@ init_mode(#st{} = St, Options) ->
 
 
 get_mode(St) ->
-    nifile:pread(St#st.fd, 5, 0).
+    file:read_file(mode_file(St)).
+
+
+mode_file(St) ->
+    <<(St#st.path)/binary, ".mode">>.
 
 
 set_raw_mode(St) ->
     {ok, St#st{mode = raw}}.
 
 
-init_crc32_mode(#st{eof = 0} = St) ->
-    {ok, Size} = nifile:write(St#st.fd, <<"crc32">>),
-    ok = nifile:sync(St#st.fd),
-    set_crc32_mode(St#st{eof = Size}).
+init_crc32_mode(#st{} = St) ->
+    ok = file:write_file(mode_file(St), <<"crc32">>, [exclusive]),
+    ok = set_read_only(mode_file(St)),
+    set_crc32_mode(St).
+
 
 set_crc32_mode(St) ->
     {ok, St#st{mode = crc32}}.
 
 
-init_gcm_mode(St, Options) ->
+init_gcm_mode(#st{} = St, Options) ->
     KeyId = keyid(Options),
     KeyIdSize = byte_size(KeyId),
 
@@ -461,27 +468,29 @@ init_gcm_mode(St, Options) ->
             %% SIV uses half the master key bits to wrap the data
             %% so there's no point making the file key longer than that.
             FileKey = crypto:strong_rand_bytes(byte_size(MasterKey) div 2),
-            {CipherText, CipherTag} = siv:encrypt(MasterKey, [KeyId], FileKey),
+            {CipherText, <<CipherTag:16/binary>>} =
+                siv:encrypt(MasterKey, [KeyId], FileKey),
             Bin = <<$g, $c, $m,
                     KeyIdSize:16,
                     KeyId/binary,
-                    CipherText/binary,
-                    CipherTag/binary>>,
-            {ok, Size} = nifile:write(St#st.fd, Bin),
-            ok = nifile:sync(St#st.fd),
-            set_gcm_mode(St#st{eof = Size}, KeyIdSize);
+                    CipherTag:16/binary,
+                    CipherText/binary>>,
+            ok = file:write_file(mode_file(St), Bin, [exclusive]),
+            ok = set_read_only(mode_file(St)),
+            set_gcm_mode(St, Bin);
         {error, Reason} ->
             {error, Reason}
     end.
 
 
-set_gcm_mode(St, KeyIdSize) ->
-    {ok, KeyId} = nifile:pread(St#st.fd, KeyIdSize, 5),
+set_gcm_mode(St, Mode) ->
+    <<$g, $c, $m,
+      KeyIdSize:16,
+      KeyId:KeyIdSize/binary,
+      CipherTag:16/binary,
+      CipherText/binary>> = Mode,
     case couch_ngen_keycache:get_key(KeyId) of
         {ok, MasterKey} ->
-            KeySize = byte_size(MasterKey) div 2,
-            {ok, <<CipherText:KeySize/binary, CipherTag:16/binary>>} =
-                nifile:pread(St#st.fd, KeySize + 16, 5 + KeyIdSize),
             case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
                 error ->
                     {error, decryption_failed};
@@ -492,6 +501,12 @@ set_gcm_mode(St, KeyIdSize) ->
             {error, Reason}
     end.
 
+
+set_read_only(Filename) ->
+    {ok, FileInfo} = file:read_file_info(Filename),
+    Mode0 = FileInfo#file_info.mode,
+    Mode1 = Mode0 band 8#00444,
+    file:write_file_info(Filename, FileInfo#file_info{mode = Mode1}).
 
 keyid(Options) when is_list(Options) ->
     {EngineOptions} = proplists:get_value(engine_options, Options, {[]}),
