@@ -38,7 +38,8 @@
 
     serialize_doc/2,
     write_doc_body/2,
-    write_doc_infos/4,
+    write_doc_infos/3,
+    purge_doc_revs/3,
 
     commit_data/1,
 
@@ -50,6 +51,7 @@
     fold_local_docs/4,
     fold_changes/5,
     count_changes_since/2,
+    fold_purged_docs/5,
 
     start_compaction/4,
     finish_compaction/4
@@ -75,7 +77,8 @@
     seq_tree_reduce/2,
 
     local_tree_split/2,
-    local_tree_join/3
+    local_tree_join/3,
+    purge_tree_reduce/2
 ]).
 
 
@@ -179,15 +182,6 @@ get(#st{} = St, DbProp) ->
     ?MODULE:get(St, DbProp, undefined).
 
 
-get(#st{} = St, last_purged, _) ->
-    case ?MODULE:get(St, purged_docs, nil) of
-        nil ->
-            [];
-        Pointer ->
-            {ok, Purged} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
-            Purged
-    end;
-
 get(#st{} = St, doc_count, _) ->
     {ok, {Count, _, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
     Count;
@@ -223,6 +217,11 @@ get(#st{} = St, security, _) ->
     Pointer = ?MODULE:get(St, security_ptr, undefined),
     {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
     SecProps;
+
+get(#st{} = St, oldest_purge_seq, _) ->
+    {ok, _, OldestSeq} = couch_ngen_btree:foldl(St#st.purge_tree,
+            fun({K, _V}, _) -> {stop, K} end, 0),
+    OldestSeq;
 
 get(#st{header = Header}, DbProp, Default) ->
     couch_ngen_header:get(Header, DbProp, Default).
@@ -321,7 +320,7 @@ write_doc_body(#st{} = St, #doc{} = Doc) ->
     {ok, Doc#doc{body = Ptr}, Len}.
 
 
-write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
+write_doc_infos(#st{} = St, Pairs, LocalDocs) ->
     #st{
         id_tree = IdTree,
         seq_tree = SeqTree,
@@ -350,26 +349,69 @@ write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
     {ok, LocalTree2} = couch_ngen_btree:add_remove(
             LocalTree, AddLDocs, RemLDocIds),
 
-    NewHeader = case PurgeInfo of
-        [] ->
-            couch_ngen_header:set(St#st.header, [
-                {update_seq, NewSeq}
-            ]);
-        _ ->
-            {ok, Ptr} = couch_ngen_file:append_term(St#st.data_fd, PurgeInfo),
-            OldPurgeSeq = couch_ngen_header:get(St#st.header, purge_seq),
-            couch_ngen_header:set(St#st.header, [
-                {update_seq, NewSeq + 1},
-                {purge_seq, OldPurgeSeq + 1},
-                {purged_docs, Ptr}
-            ])
-    end,
+    NewHeader = couch_ngen_header:set(St#st.header, [
+        {update_seq, NewSeq}
+    ]),
 
     {ok, St#st{
         header = NewHeader,
         id_tree = IdTree2,
         seq_tree = SeqTree2,
         local_tree = LocalTree2,
+        needs_commit = true
+    }}.
+
+
+purge_doc_revs(#st{} = St, {OldFDI, NewFDI}, PurgedIdRevs) ->
+    #st{
+        id_tree = IdTree,
+        seq_tree = SeqTree,
+        purge_tree = PurgeTree
+    } = St,
+    {Add, RemIds, RemSeqs, NewUpdateSeq} = case {OldFDI, NewFDI} of
+        {#full_doc_info{id = Id}, #full_doc_info{id = Id}} ->
+            {
+               [NewFDI],
+               [],
+               [OldFDI#full_doc_info.update_seq],
+                NewFDI#full_doc_info.update_seq
+            };
+        {#full_doc_info{id = Id}, not_found} ->
+            % We bump NewUpdateSeq because we have to ensure that
+            % indexers see that they need to process the new purge
+            % information.
+            {
+                [],
+                [Id],
+                [OldFDI#full_doc_info.update_seq],
+                ?MODULE:get(St, update_seq) + 1
+            }
+    end,
+
+    {ok, IdTree2} = couch_ngen_btree:add_remove(IdTree, Add, RemIds),
+    {ok, SeqTree2} = couch_ngen_btree:add_remove(SeqTree, Add, RemSeqs),
+
+    NewPurgeSeq = couch_ngen_header:get(St#st.header, purge_seq) + 1,
+    AddReqs = [{NewPurgeSeq, PurgedIdRevs}],
+
+    % check if oldest purge request need to be deleted
+    % to keep only PurgeDocsLimit number of requests in purge_tree
+    Limit = couch_ngen_header:purged_docs_limit(St#st.header),
+    {ok, Count} = couch_ngen_btree:full_reduce(PurgeTree),
+    RemPSeqs = if (Count < Limit) ->  []; true ->
+        [?MODULE:get(St, oldest_purge_seq)]
+    end,
+    {ok, PurgeTree2} = couch_ngen_btree:add_remove(PurgeTree, AddReqs, RemPSeqs),
+
+    Header2 = couch_ngen_header:set(St#st.header, [
+        {update_seq, NewUpdateSeq},
+        {purge_seq, NewPurgeSeq}
+    ]),
+    {ok, St#st{
+        header = Header2,
+        id_tree = IdTree2,
+        seq_tree = SeqTree2,
+        purge_tree = PurgeTree2,
         needs_commit = true
     }}.
 
@@ -440,6 +482,23 @@ fold_changes(St, SinceSeq, UserFun, UserAcc, Options) ->
     {ok, FinalUserAcc}.
 
 
+fold_purged_docs(St, StartSeq0, UserFun, UserAcc, Options) ->
+    StartSeq = StartSeq0 + 1,
+    PurgeTree = St#st.purge_tree,
+    {ok, _, MinSeq} = couch_ngen_btree:foldl(PurgeTree,
+            fun({K, _V}, _) -> {stop, K} end, 0),
+    if (MinSeq =< StartSeq) ->
+        Fun = fun drop_reductions2/4,
+        InAcc = {UserFun, UserAcc},
+        Opts = [{start_key, StartSeq}] ++ Options,
+        {ok, _, OutAcc} = couch_ngen_btree:fold(PurgeTree, Fun, InAcc, Opts),
+        {_, FinalUserAcc} = OutAcc,
+        {ok, FinalUserAcc};
+    true ->
+        throw({invalid_start_purge_seq, StartSeq0})
+    end.
+
+
 count_changes_since(St, SinceSeq) ->
     BTree = St#st.seq_tree,
     FoldFun = fun(_SeqStart, PartialReds, 0) ->
@@ -451,9 +510,11 @@ count_changes_since(St, SinceSeq) ->
 
 
 start_compaction(St, DbName, Options, Parent) ->
-    Args = [St, DbName, Options, Parent],
-    Pid = spawn_link(couch_ngen_compactor, start, Args),
-    {ok, St, Pid}.
+    % recording purge_seq at the start of compaction
+    NewHeader = couch_ngen_header:set(St#st.header, [
+        {compact_purge_seq, couch_ngen_header:purge_seq(St#st.header)}
+    ]),
+    start_compaction_int(St#st{header=NewHeader}, DbName, Options, Parent).
 
 
 finish_compaction(SrcSt, DbName, Options, DirPath) ->
@@ -464,16 +525,43 @@ finish_compaction(SrcSt, DbName, Options, DirPath) ->
         true ->
             finish_compaction_int(SrcSt, TgtSt1);
         false ->
-            couch_log:info("Compaction file still behind main file "
-                           "(update seq=~p. compact update seq=~p). Retrying.",
-                           [SrcSeq, TgtSeq]),
-            ok = decref(TgtSt1),
-            start_compaction(SrcSt, DbName, Options, self())
+            % check if there were too many purge requests during compaction
+            % We're being extra cautious here so that a bug in purge doesn't
+            % give us a corrupted db after compaction
+            OldestPurgeSeq = couch_ngen:get(SrcSt, oldest_purge_seq),
+            CompactPurgeSeq = couch_ngen:get(SrcSt, compact_purge_seq),
+            case (OldestPurgeSeq =< (CompactPurgeSeq + 1)) of
+                true ->
+                    couch_log:info("Compaction file still behind main file "
+                            "(update seq=~p. compact update seq=~p). Retrying.",
+                            [SrcSeq, TgtSeq]),
+                    ok = decref(TgtSt1),
+                    start_compaction_int(SrcSt, DbName, Options, self());
+                false ->
+                    % there were too may purge requests that overwrote CompactPurgeSeq
+                    % restart compaction from the beginning
+                    couch_log:info("Restarting compaction from beginning: "
+                            "during compaction docs were purged beyond compact_purge_seq=~p).",
+                            [CompactPurgeSeq]),
+                    ok = decref(TgtSt1),
+                    delete_compaction_files(DirPath),
+                    start_compaction(SrcSt, DbName, Options, self())
+            end
     end.
 
-
-id_seq_tree_split({Key, Ptr}, _DataFd) ->
-    {Key, Ptr}.
+id_seq_tree_split(#full_doc_info{} = FDI, DataFd) ->
+    #full_doc_info{
+        id = Id,
+        update_seq = Seq,
+        deleted = Deleted,
+        sizes = SizeInfo,
+        rev_tree = Tree
+    } = FDI,
+    DiskTerm = {Id, Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree)},
+    {ok, Ptr} = couch_ngen_file:append_term(DataFd, DiskTerm),
+    {Id, Ptr};
+id_seq_tree_split({Id, Ptr}, _DataFd) ->
+    {Id, Ptr}.
 
 
 id_seq_tree_join(_Key, DiskPtr, DataFd) ->
@@ -509,6 +597,12 @@ seq_tree_reduce(reduce, DocInfos) ->
     % count the number of documents
     length(DocInfos);
 seq_tree_reduce(rereduce, Reds) ->
+    lists:sum(Reds).
+
+
+purge_tree_reduce(reduce, IdRevs) ->
+    length(IdRevs);
+purge_tree_reduce(rereduce, Reds) ->
     lists:sum(Reds).
 
 
@@ -642,7 +736,8 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
     end,
 
     Header1 = couch_ngen_header:upgrade(Header0),
-    Header = set_default_security_object(DataFd, Header1, Options),
+    Header2 = set_default_security_object(DataFd, Header1, Options),
+    Header = upgrade_purge_info(DataFd, Header2),
 
     IdTreeState = couch_ngen_header:id_tree_state(Header),
     {ok, IdTree} = couch_ngen_btree:open(IdTreeState, IdxFd, [
@@ -667,8 +762,12 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
             {user_ctx, DataFd}
         ]),
 
-    [couch_ngen_file:set_db_pid(Fd, self()) || Fd <- [CPFd, IdxFd, DataFd]],
+    PurgeTreeState = couch_ngen_header:purge_tree_state(Header),
+    {ok, PurgeTree} = couch_ngen_btree:open(PurgeTreeState, IdxFd, [
+        {reduce, fun ?MODULE:purge_tree_reduce/2}
+    ]),
 
+    [couch_ngen_file:set_db_pid(Fd, self()) || Fd <- [CPFd, IdxFd, DataFd]],
     St = #st{
         dirpath = DirPath,
         cp_fd = CPFd,
@@ -685,7 +784,8 @@ init_state(DirPath, CPFd, IdxFd, DataFd, Header0, Options) ->
         id_tree = IdTree,
         seq_tree = SeqTree,
         local_tree = LocalTree,
-        compression = couch_compress:get_compression_method()
+        compression = couch_compress:get_compression_method(),
+        purge_tree = PurgeTree
     },
 
     UpgradedHeader = Header /= Header0,
@@ -701,7 +801,8 @@ update_header(St, Header) ->
     couch_ngen_header:set(Header, [
         {seq_tree_state, couch_ngen_btree:get_state(St#st.seq_tree)},
         {id_tree_state, couch_ngen_btree:get_state(St#st.id_tree)},
-        {local_tree_state, couch_ngen_btree:get_state(St#st.local_tree)}
+        {local_tree_state, couch_ngen_btree:get_state(St#st.local_tree)},
+        {purge_tree_state, couch_ngen_btree:get_state(St#st.purge_tree)}
     ]).
 
 
@@ -713,6 +814,34 @@ set_default_security_object(Fd, Header, Options) ->
             Default = couch_util:get_value(default_security_object, Options),
             {ok, Ptr} = couch_ngen_file:append_term(Fd, Default),
             couch_ngen_header:set(Header, security_ptr, Ptr)
+    end.
+
+
+% This function is here, and not in couch_ngen_header
+% because it requires modifying file contents
+upgrade_purge_info(Fd, Header) ->
+    case couch_ngen_header:get(Header, purge_tree_state) of
+    nil ->
+        Header;
+    Ptr when is_tuple(Ptr) ->
+        Header;
+    Ptr when is_integer(Ptr)->
+        % old PurgeDocs format - upgrade to purge_tree
+        {ok, PurgedIdRevs} = couch_ngen_file:read_term(Fd, Ptr), %???
+        PSeq = couch_ngen_header:purge_seq(Header),
+        {NPSeq, AddPurgeReqs} = lists:foldl(fun(IdRevs, {Seq, Acc}) ->
+            {Seq+1, [{Seq+1,IdRevs} | Acc]}
+        end, {PSeq-1,[]}, PurgedIdRevs),
+        {ok, PTree0} = couch_ngen_btree:open(nil, Fd, [
+            {reduce, fun ?MODULE:purge_tree_reduce/2}
+         ]),
+        {ok, PTree} = couch_ngen_btree:add_remove(PTree0, AddPurgeReqs, []),
+        PTreeState = couch_ngen_btree:get_state(PTree),
+        couch_ngen:set(Header, [
+            {purge_seq, NPSeq},
+            {compact_purge_seq, NPSeq},
+            {purge_tree_state, PTreeState}
+        ])
     end.
 
 
@@ -907,36 +1036,119 @@ drop_reductions(_, _, _, Acc) ->
     {ok, Acc}.
 
 
+drop_reductions2(visit, {PurgeSeq, IdRevs}, _Reds, {UserFun, UserAcc}) ->
+    {Go, NewUserAcc} = UserFun(PurgeSeq, IdRevs, UserAcc),
+    {Go, {UserFun, NewUserAcc}};
+drop_reductions2(_, _, _, Acc) ->
+    {ok, Acc}.
+
+
 fold_docs_reduce_to_count(Reds) ->
     RedFun = fun id_tree_reduce/2,
     FinalRed = couch_ngen_btree:final_reduce(RedFun, Reds),
     element(1, FinalRed).
 
 
+start_compaction_int(St, DbName, Options, Parent) ->
+    Args = [St, DbName, Options, Parent],
+    Pid = spawn_link(couch_ngen_compactor, start, Args),
+    {ok, St, Pid}.
+
+
 finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
     #st{
         dirpath = DirPath,
+        header = OldHdr,
         local_tree = OldLocal
     } = OldSt,
     #st{
         dirpath = DirPath,
-        header = Header,
+        header = NewHdr,
         local_tree = NewLocal1
     } = NewSt1,
+
+
+    % copy purge info to NewSt2 or throw an error
+    PurgeSeq = couch_ngen_header:purge_seq(OldHdr),
+    CompactPurgeSeq = couch_ngen_header:compact_purge_seq(OldHdr),
+    PurgedDocsLimit = couch_ngen_header:purged_docs_limit(OldHdr),
+    NewSt2 = if PurgeSeq == 0 -> NewSt1; true ->
+        % copy purge tree
+        PTreeLoadFun = fun(Value, _Offset, Acc) ->
+            {ok, [Value | Acc]}
+        end,
+        {ok, _, PSeqIdRevs} = couch_ngen_btree:foldl(OldSt#st.purge_tree,
+            PTreeLoadFun, []),
+        {ok, NewPurgeTree} = couch_ngen_btree:add(NewSt1#st.purge_tree,
+            lists:reverse(PSeqIdRevs)),
+
+        % check if there were purge requests during compact
+        case PurgeSeq == CompactPurgeSeq of
+        true ->
+            NewSt1#st{purge_tree = NewPurgeTree};
+        false ->
+            PurgeFoldFun = fun(_PurgeSeq, {Id, Revs}, {AccIds, AccIdRevs}) ->
+                {ok, {[Id|AccIds], [{Id, Revs}|AccIdRevs]} }
+            end,
+            % collect purge requests since CompactPurgeSeq
+            % fold_purged_docs throws an exception if
+            % CompactPurgeSeq was pruned during compaction
+            try
+                {ok, {DocIds, IdRevs}} = fold_purged_docs(OldSt, CompactPurgeSeq,
+                        PurgeFoldFun, {[], []}, []),
+                OldDocInfos = open_docs(NewSt1, DocIds),
+
+                % Since purging a document will change the update_seq,
+                % finish_compaction will restart compaction in order to process
+                % the new updates, which takes care of handling partially
+                % purged documents.
+                % collect only Ids and Seqs of docs that were completely purged
+                {RemIds, RemSeqs} = lists:foldl(fun({OldFDI, {Id,Revs}},
+                        {ARemIds, ARemSeqs}) ->
+                    #full_doc_info{rev_tree=Tree, update_seq=UpSeq} = OldFDI,
+                    case couch_key_tree:remove_leafs(Tree, Revs) of
+                        {[]= _NewTree, _} ->
+                           {[Id| ARemIds], [UpSeq| ARemSeqs]};
+                        _ ->
+                            {ARemIds, ARemSeqs}
+                    end
+                end, {[], []}, lists:zip(OldDocInfos, IdRevs)),
+
+                % remove from NewSt docs that were completely purged
+                case {RemIds, RemSeqs} of
+                    {[], []} ->
+                        NewSt1#st{purge_tree = NewPurgeTree};
+                    _ ->
+                        {ok, IdTree2} = couch_ngen_btree:add_remove(NewSt1#st.id_tree,
+                                [], RemIds),
+                        {ok, SeqTree2} = couch_ngen_btree:add_remove(NewSt1#st.seq_tree,
+                                [], RemSeqs),
+                        NewSt1#st{purge_tree = NewPurgeTree, id_tree = IdTree2,
+                                seq_tree = SeqTree2}
+                end
+            catch
+                throw:{invalid_start_purge_seq, CompactPurgeSeq} ->
+                    throw({invalid_start_purge_seq, CompactPurgeSeq})
+            end
+        end
+    end,
 
     % suck up all the local docs into memory and write them to the new db
     LoadFun = fun(Value, _Offset, Acc) ->
         {ok, [Value | Acc]}
     end,
     {ok, _, LocalDocs} = couch_ngen_btree:foldl(OldLocal, LoadFun, []),
-    {ok, NewLocal2} = couch_ngen_btree:add(NewLocal1, LocalDocs),
+    {ok, NewLocal3} = couch_ngen_btree:add(NewLocal1, LocalDocs),
 
-    {ok, NewSt2} = commit_data(NewSt1#st{
-        header = couch_bt_engine_header:set(Header, [
+    {ok, NewSt3} = commit_data(NewSt2#st{
+        header = couch_ngen_header:set(NewHdr, [
             {compacted_seq, ?MODULE:get(OldSt, update_seq)},
-            {revs_limit, ?MODULE:get(OldSt, revs_limit)}
+            {revs_limit, ?MODULE:get(OldSt, revs_limit)},
+            {purge_seq, PurgeSeq},
+            {compact_purge_seq, PurgeSeq},
+            {purged_docs_limit, PurgedDocsLimit}
         ]),
-        local_tree = NewLocal2
+        local_tree = NewLocal3
     }),
 
     % Move our compaction files into place
@@ -953,7 +1165,7 @@ finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
     ok = remove_compact_suffix(NewSt2#st.cp_fd),
 
     decref(OldSt),
-    {ok, NewSt2, undefined}.
+    {ok, NewSt3, undefined}.
 
 
 remove_compact_suffix(Fd) ->
