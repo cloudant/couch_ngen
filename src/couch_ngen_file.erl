@@ -337,7 +337,10 @@ handle_call({append, Bin}, _From, St) ->
             },
             {reply, {error, incomplete_write}, NewSt, ?MONITOR_CHECK};
         Error ->
-            {reply, Error, St, ?MONITOR_CHECK}
+            %% some data might have been written before the error
+            %% so we need to check eof the slow way.
+            {ok, Eof} = file:position(St#st.fd, eof),
+            {reply, Error, St#st{eof = Eof}, ?MONITOR_CHECK}
     end.
 
 
