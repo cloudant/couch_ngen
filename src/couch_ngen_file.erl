@@ -23,7 +23,7 @@
     pid,
     fd,
     t2bopts,
-    mode :: raw | crc32 | {gcm, binary()}
+    mode :: raw | crc32 | {gcm, pid()}
 }).
 
 
@@ -34,7 +34,7 @@
     eof = 0,
     t2bopts = [],
     db_pid,
-    mode :: raw | crc32 | {gcm, binary()}
+    mode :: raw | crc32 | {gcm, pid()}
 }).
 
 
@@ -231,10 +231,10 @@ read_bin(#ngenfd{mode = crc32} = Fd, {Pos, Len}) ->
             {error, Reason}
     end;
 
-read_bin(#ngenfd{mode = {gcm, Key}} = Fd, {Pos, Len}) ->
+read_bin(#ngenfd{mode = {gcm, Pid}} = Fd, {Pos, Len}) ->
     case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
         {ok, Bin} ->
-            case gcm_decrypt(Key, Pos, Bin) of
+            case couch_ngen_crypto:decrypt(Pid, Pos, Bin) of
                 error ->
                     {error, decryption_failed};
                 PlainText ->
@@ -462,41 +462,24 @@ set_crc32_mode(St) ->
 init_gcm_mode(#st{} = St, Options) ->
     KeyId = keyid(Options),
     KeyIdSize = byte_size(KeyId),
-
-    case couch_ngen_keycache:get_key(KeyId) of
-        {ok, MasterKey} ->
-            %% SIV uses half the master key bits to wrap the data
-            %% so there's no point making the file key longer than that.
-            FileKey = crypto:strong_rand_bytes(byte_size(MasterKey) div 2),
-            {CipherText, <<CipherTag:16/binary>>} =
-                siv:encrypt(MasterKey, [KeyId], FileKey),
-            Bin = <<$g, $c, $m,
-                    KeyIdSize:16,
-                    KeyId/binary,
-                    CipherTag:16/binary,
-                    CipherText/binary>>,
-            ok = file:write_file(mode_file(St), Bin, [exclusive]),
-            ok = set_read_only(mode_file(St)),
-            set_gcm_mode(St, Bin);
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    {ok, Pid, WrappedKey} = couch_ngen_crypto:start_link(KeyId),
+    Bin = <<$g, $c, $m,
+            KeyIdSize:16,
+            KeyId/binary,
+            WrappedKey/binary>>,
+    ok = file:write_file(mode_file(St), Bin, [exclusive]),
+    ok = set_read_only(mode_file(St)),
+    {ok, St#st{mode = {gcm, Pid}}}.
 
 
 set_gcm_mode(St, Mode) ->
     <<$g, $c, $m,
       KeyIdSize:16,
       KeyId:KeyIdSize/binary,
-      CipherTag:16/binary,
-      CipherText/binary>> = Mode,
-    case couch_ngen_keycache:get_key(KeyId) of
-        {ok, MasterKey} ->
-            case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
-                error ->
-                    {error, decryption_failed};
-                FileKey ->
-                    {ok, St#st{mode = {gcm, FileKey}}}
-            end;
+      WrappedKey/binary>> = Mode,
+    case couch_ngen_crypto:start_link(KeyId, WrappedKey) of
+        {ok, Pid} ->
+            {ok, St#st{mode = {gcm, Pid}}};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -536,21 +519,8 @@ is_idle(#st{}) ->
     end.
 
 
-maybe_encrypt(#st{mode = {gcm, Key}} = St, Bin) ->
-    gcm_encrypt(Key, St#st.eof, Bin);
+maybe_encrypt(#st{mode = {gcm, Pid}} = St, Bin) ->
+    couch_ngen_crypto:encrypt(Pid, St#st.eof, Bin);
 
 maybe_encrypt(#st{}, Bin) ->
     Bin.
-
-
-gcm_encrypt(Key, Pos, PlainText)
-  when Pos >= 0, Pos =< 16#1000000000000000000000000 ->
-    {CipherText, CipherTag} = crypto:block_encrypt(
-       aes_gcm, Key, <<Pos:96>>, {<<>>, PlainText, 16}),
-    <<CipherTag:16/binary, CipherText/binary>>.
-
-
-gcm_decrypt(Key, Pos, <<CipherTag:16/binary, CipherText/binary>>)
-  when Pos >= 0, Pos =< 16#1000000000000000000000000 ->
-    crypto:block_decrypt(
-        aes_gcm, Key, <<Pos:96>>, {<<>>, CipherText, CipherTag}).
