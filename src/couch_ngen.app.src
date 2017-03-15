@@ -18,6 +18,5 @@
         stdlib,
         nifile,
         couch
-    ]},
-    {mod, {couch_ngen_app, []}}
+    ]}
 ]}.
