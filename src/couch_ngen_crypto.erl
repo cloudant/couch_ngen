@@ -95,21 +95,19 @@ fetch_master_key(KeyId) ->
 
 
 generate_file_key(MasterKey) ->
-    %% SIV uses half the master key bits to wrap the data
-    %% so there's no point making the file key longer than that.
-    crypto:strong_rand_bytes(byte_size(MasterKey) div 2).
+    crypto:strong_rand_bytes(byte_size(MasterKey)).
 
 
 wrap_file_key(KeyId, MasterKey, FileKey) ->
     {CipherText, <<CipherTag:16/binary>>} =
-        siv:encrypt(MasterKey, [KeyId], FileKey),
+        siv:encrypt(expand(MasterKey), [KeyId], FileKey),
     <<CipherTag:16/binary, CipherText/binary>>.
 
 
 unwrap_file_key(KeyId, MasterKey, WrappedKey) ->
     <<CipherTag:16/binary,
       CipherText/binary>> = WrappedKey,
-    case siv:decrypt(MasterKey, [KeyId], {CipherText, CipherTag}) of
+    case siv:decrypt(expand(MasterKey), [KeyId], {CipherText, CipherTag}) of
         error ->
             {error, decryption_failed};
         FileKey ->
@@ -128,3 +126,18 @@ gcm_decrypt(Key, IV, <<CipherTag:16/binary, CipherText/binary>>)
   when IV >= 0, IV =< 16#1000000000000000000000000 ->
     crypto:block_decrypt(
         aes_gcm, Key, <<IV:96>>, {<<>>, CipherText, CipherTag}).
+
+
+%% because SIV only uses half the bits of the input key
+%% to encrypt and the other half for the authentication/IV
+%% we expand our keys to 512 to ensure an overall security
+%% threshold of 256.
+expand(Key) when bit_size(Key) == 512 ->
+    Key; % 512 is enough for anyone.
+expand(Key) when bit_size(Key) == 256 ->
+    %% expansion technique from Bjoern Tackmann - IBM Zurich
+    K0 = crypto:block_encrypt(aes_ecb, Key, <<0:128>>),
+    K1 = crypto:block_encrypt(aes_ecb, Key, <<1:128>>),
+    K2 = crypto:block_encrypt(aes_ecb, Key, <<2:128>>),
+    K3 = crypto:block_encrypt(aes_ecb, Key, <<3:128>>),
+    <<K0/binary, K1/binary, K2/binary, K3/binary>>.

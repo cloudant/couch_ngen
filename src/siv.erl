@@ -57,7 +57,7 @@ double(<<1:1, Lo:127>>) ->
     crypto:exor(<<(Lo bsl 1):128>>, <<16#87:128>>).
 
 
-generate_subkeys(Key) when bit_size(Key) == 128 ->
+generate_subkeys(Key) ->
     L = crypto:block_encrypt(aes_ecb, Key, <<0:128>>),
     K1 = double(L),
     K2 = double(K1),
@@ -153,6 +153,25 @@ decrypt_test_() ->
                  <<16#09f911029d74e35bd84156c5635688c0:128>>],
              {<<16#cb900f2fddbe404326601965c889bf17dba77ceb094fa663b7a3f748ba8af829ea64ad544a272e9c485b62a3fd5c0d:376>>,
               <<16#7bdb6e3b432667eb06f4d14bff2fbd0f:128>>}))
+    ].
+
+cmac_test_() ->
+    [
+     ?_assertEqual(<<16#bb1d6929e95937287fa37d129b756746:128>>,
+         cmac(<<16#2b7e151628aed2a6abf7158809cf4f3c:128>>,
+         <<>>)),
+
+     ?_assertEqual(<<16#070a16b46b4d4144f79bdd9dd04a287c:128>>,
+         cmac(<<16#2b7e151628aed2a6abf7158809cf4f3c:128>>,
+         <<16#6bc1bee22e409f96e93d7e117393172a:128>>)),
+
+     ?_assertEqual(<<16#028962f61b7bf89efc6b551f4667d983:128>>,
+         cmac(<<16#603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4:256>>,
+         <<>>)),
+
+     ?_assertEqual(<<16#28a7023f452e8f82bd4bf28d8c37c35c:128>>,
+         cmac(<<16#603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4:256>>,
+         <<16#6bc1bee22e409f96e93d7e117393172a:128>>))
     ].
 
 -endif.
