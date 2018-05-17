@@ -322,13 +322,12 @@ copy_leaves(_Rev, #leaf{} = Leaf, leaf, {CompSt, SizesAcc}) ->
     } = Leaf,
 
     Doc = copy_doc_attachments(SrcSt, TgtSt, Ptr),
-    DiskAtts = [couch_att:to_disk_term(A) || A <- Doc#doc.atts],
-    DocBin = couch_ngen:serialize_doc(TgtSt, Doc#doc{atts = DiskAtts}),
+    DocBin = couch_ngen:serialize_doc(TgtSt, Doc),
 
     {ok, NewPtr} = couch_ngen_file:append_bin(TgtSt#st.data_fd, DocBin#doc.body),
 
     AttSizeFun = fun(Att) ->
-        [{_, Sp}, Size] = couch_att:fetch([data, att_len], Att),
+        {_, _, Sp, Size, _, _, _, _} = Att,
         {Sp, Size}
     end,
 
@@ -349,15 +348,15 @@ copy_doc_attachments(SrcSt, TgtSt, DocPtr) ->
         atts = AttInfos
     } = couch_ngen:read_doc_body(SrcSt, #doc{body=DocPtr}),
 
-    StreamFun = fun(Sp) -> couch_ngen:open_read_stream(SrcSt, Sp) end,
-    LoadFun = fun(Info) -> couch_att:from_disk_term(StreamFun, Info) end,
-    Atts = lists:map(LoadFun, AttInfos),
-
-    CopyFun = fun(Att) ->
-        {ok, Dst} = couch_ngen:open_write_stream(TgtSt, []),
-        couch_att:copy(Att, Dst)
+    CopyFun = fun({Name, Type, BinSp, AttLen, DiskLen, RevPos, Md5, Enc}) ->
+        {ok, SrcStream} = couch_ngen:open_read_stream(SrcSt, BinSp),
+        {ok, DstStream} = couch_ngen:open_write_stream(TgtSt, []),
+        ok = couch_stream:copy(SrcStream, DstStream),
+        {NewStream, AttLen, _, ActualMd5, _} = couch_stream:close(DstStream),
+        {ok, NewBinSp} = couch_stream:to_disk_term(NewStream),
+        {Name, Type, NewBinSp, AttLen, DiskLen, RevPos, Md5, Enc}
     end,
-    CopiedAtts = lists:map(CopyFun, Atts),
+    CopiedAtts = lists:map(CopyFun, AttInfos),
 
     #doc{
        body = Body,
