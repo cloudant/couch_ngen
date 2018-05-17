@@ -535,6 +535,9 @@ seq_tree_reduce(rereduce, Reds) ->
     lists:sum(Reds).
 
 
+local_tree_split(#doc{revs = {0, [Rev]}} = Doc, DataFd) when is_binary(Rev) ->
+    local_tree_split(Doc#doc{revs = {0, [binary_to_integer(Rev)]}}, DataFd);
+
 local_tree_split(#doc{} = Doc, DataFd) ->
     #doc{
         id = Id,
@@ -550,7 +553,7 @@ local_tree_join(Id, Ptr, DataFd) ->
     {ok, {Rev, BodyData}} = couch_ngen_file:read_term(DataFd, Ptr),
     #doc{
         id = Id,
-        revs = {0, [Rev]},
+        revs = {0, [integer_to_binary(Rev)]},
         body = BodyData
     }.
 
