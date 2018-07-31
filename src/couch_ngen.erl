@@ -21,8 +21,8 @@
 
     init/2,
     terminate/2,
-    handle_call/2,
-    handle_info/2,
+    handle_db_updater_call/2,
+    handle_db_updater_info/2,
 
     incref/1,
     decref/1,
@@ -162,11 +162,11 @@ terminate(_Reason, St) ->
     ok.
 
 
-handle_call(Msg, St) ->
+handle_db_updater_call(Msg, St) ->
     {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
 
 
-handle_info({'DOWN', _, _, _, _}, St) ->
+handle_db_updater_info({'DOWN', _, _, _, _}, St) ->
     {stop, normal, St}.
 
 
