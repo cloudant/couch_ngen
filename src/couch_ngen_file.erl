@@ -57,6 +57,8 @@
 
     length/1,
 
+    last_read/1,
+
     rename/2,
     path/1,
     bytes/1,
@@ -171,6 +173,11 @@ length({Pos, Len}) when is_integer(Pos), is_integer(Len) ->
     Len.
 
 
+last_read(#ngenfd{} = Fd) ->
+    Now = os:timestamp(),
+    couch_util:process_dict_get(Fd#ngenfd.pid, read_timestamp, Now).
+
+
 sync(#ngenfd{} = Fd) ->
     gen_server:call(Fd#ngenfd.pid, sync, infinity).
 
@@ -226,9 +233,11 @@ read_term(Fd, Ptr) ->
 
 
 read_bin(#ngenfd{raw = true} = Fd, {Pos, Len}) ->
+    update_read_timestamp(Fd),
     nifile:pread(Fd#ngenfd.fd, Len, Pos);
 
 read_bin(Fd, {Pos, Len}) ->
+    update_read_timestamp(Fd),
     case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
         {ok, <<0, Value/binary>>} ->
             {ok, Value};
@@ -342,6 +351,10 @@ handle_call({append, Bin}, _From, St) ->
     end.
 
 
+handle_cast({update_read_timestamp, TS}, St) ->
+    update_read_timestamp(TS),
+    {noreply, St};
+
 handle_cast(close, Fd) ->
     {stop, normal, Fd}.
 
@@ -372,6 +385,8 @@ code_change(_OldVsn, St, _Extra) ->
 
 
 init_st(FilePath, RawFd, Parent, Options) ->
+    Now = os:timestamp(),
+    update_read_timestamp(Now),
     maybe_track(Options),
     case proplists:get_value(overwrite, Options) of
         true ->
@@ -403,6 +418,16 @@ maybe_track(Options) ->
     if IsSys -> ok; true ->
         couch_stats_process_tracker:track([couchdb_ngen, open_nifiles])
     end.
+
+
+update_read_timestamp(#ngenfd{pid = Pid}) ->
+    TS = {MegaSecs, Secs, _} = os:timestamp(),
+    case couch_util:process_dict_get(Pid, read_timestamp) of
+        {MegaSecs, Secs, _} -> ok;
+        _ -> gen_server:cast(Pid, {update_read_timestamp, TS})
+    end;
+update_read_timestamp(TS) ->
+    put(read_timestamp, TS).
 
 
 is_idle(#st{is_sys = true}) ->

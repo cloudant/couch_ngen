@@ -28,6 +28,8 @@
     decref/1,
     monitored_by/1,
 
+    last_activity/1,
+
     get_compacted_seq/1,
     get_del_doc_count/1,
     get_disk_version/1,
@@ -190,6 +192,10 @@ monitored_by(St) ->
         MB = couch_ngen_file:monitored_by(Fd),
         lists:umerge(lists:sort(MB), Acc)
     end, [], [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]).
+
+
+last_activity(St) ->
+    couch_ngen_file:last_read(St#st.data_fd).
 
 
 get_compacted_seq(#st{header = Header}) ->
