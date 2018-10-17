@@ -22,9 +22,8 @@
 -record(ngenfd, {
     pid,
     fd,
-    raw = false,
     t2bopts,
-    hash
+    mode :: raw | crc32 | aegis
 }).
 
 
@@ -36,6 +35,9 @@
     t2bopts = [],
     db_pid
 }).
+
+
+-include_lib("kernel/include/file.hrl").
 
 
 -export([
@@ -205,44 +207,48 @@ append_term(#ngenfd{} = Fd, Term) ->
 append_bin(Fd, Bin) when is_list(Bin) ->
     append_bin(Fd, iolist_to_binary(Bin));
 
-append_bin(#ngenfd{raw = true} = Fd, Bin) ->
+append_bin(#ngenfd{mode = raw} = Fd, Bin) ->
     gen_server:call(Fd#ngenfd.pid, {append, Bin});
 
-append_bin(#ngenfd{hash = undefined} = Fd, Bin) ->
-    gen_server:call(Fd#ngenfd.pid, {append, <<0, Bin/binary>>});
+append_bin(#ngenfd{mode = crc32} = Fd, Bin0) ->
+    Crc32 = erlang:crc32(Bin0),
+    Bin = <<Crc32:32/integer, Bin0/binary>>,
+    gen_server:call(Fd#ngenfd.pid, {append, Bin});
 
-append_bin(Fd, Bin) when is_binary(Bin) ->
-    NameBin = list_to_binary(atom_to_list(Fd#ngenfd.hash)),
-    ValueBin = hash(Bin, Fd#ngenfd.hash),
-    NameSize = size(NameBin),
-    ValueSize = size(ValueBin),
-    true = NameSize < 256 andalso ValueSize < 256,
-    FileBin = <<
-            NameSize:8,
-            ValueSize:8,
-            NameBin/binary,
-            ValueBin/binary,
-            Bin/binary
-        >>,
-    gen_server:call(Fd#ngenfd.pid, {append, FileBin}).
+append_bin(#ngenfd{mode = aegis} = Fd, Bin) ->
+    gen_server:call(Fd#ngenfd.pid, {encode_append, Bin}).
 
 
 read_term(Fd, Ptr) ->
+    update_read_timestamp(Fd),
     {ok, Bin} = read_bin(Fd, Ptr),
     {ok, binary_to_term(Bin)}.
 
 
-read_bin(#ngenfd{raw = true} = Fd, {Pos, Len}) ->
-    update_read_timestamp(Fd),
+read_bin(#ngenfd{mode = raw} = Fd, {Pos, Len}) ->
     nifile:pread(Fd#ngenfd.fd, Len, Pos);
 
-read_bin(Fd, {Pos, Len}) ->
-    update_read_timestamp(Fd),
+read_bin(#ngenfd{mode = crc32} = Fd, {Pos, Len}) ->
+    case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
+        {ok, <<Crc32:32/integer, Bin/binary>>} ->
+            case erlang:crc32(Bin) of
+                Crc32 ->
+                    {ok, Bin};
+                OtherCrc32 ->
+                    {error, {hash_mismatch, Crc32, OtherCrc32}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end;
+
+read_bin(#ngenfd{mode = aegis} = Fd, {Pos, Len}) ->
     case nifile:pread(Fd#ngenfd.fd, Len, Pos) of
         {ok, <<0, Value/binary>>} ->
-            {ok, Value};
-        {ok, HashBin} ->
-            verify(HashBin)
+            gen_server:call(Fd#ngenfd.pid, {decode, {Pos, Value}});
+        {ok, _} ->
+            {error, checkbyte_mismatch};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 
@@ -251,6 +257,7 @@ truncate(Fd, Pos) ->
 
 
 init({FilePath, Parent, Options}) ->
+    process_flag(sensitive, true),
     process_flag(trap_exit, true),
 
     Create = lists:member(create, Options),
@@ -264,16 +271,19 @@ init({FilePath, Parent, Options}) ->
 
     case nifile:open(FilePath, OpenOpts) of
         {ok, Fd} ->
-            St = init_st(FilePath, Fd, Parent, Options),
-            ExtFd = #ngenfd{
-                pid = self(),
-                fd = Fd,
-                raw = lists:member(raw, Options),
-                t2bopts = St#st.t2bopts,
-                hash = proplists:get_value(hash, Options)
-            },
-            proc_lib:init_ack({ok, ExtFd}),
-            gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
+            case init_st(FilePath, Fd, Parent, Options) of
+                {ok, St} ->
+                    ExtFd = #ngenfd{
+                        pid = self(),
+                        fd = Fd,
+                        t2bopts = St#st.t2bopts,
+                        mode = proplists:get_value(mode, Options, raw)
+                    },
+                    proc_lib:init_ack({ok, ExtFd}),
+                    gen_server:enter_loop(?MODULE, [], St, ?INITIAL_WAIT);
+                Error ->
+                    proc_lib:init_ack(Error)
+            end;
         Error ->
             proc_lib:init_ack(Error)
     end.
@@ -328,6 +338,11 @@ handle_call({truncate, Pos}, _From, St) ->
         Error -> {reply, Error, St, ?MONITOR_CHECK}
     end;
 
+handle_call({encode_append, Bin0}, From, #st{eof = Eof} = St) ->
+    {ok, DEK} = get(dek),
+    Bin = aegis:block_encrypt(DEK, Eof, Bin0),
+    handle_call({append, <<0, Bin/binary>>}, From, St);
+
 handle_call({append, Bin}, _From, St) ->
     #st{
         eof = Eof
@@ -348,7 +363,12 @@ handle_call({append, Bin}, _From, St) ->
         Error ->
             {ok, Eof} = nifile:seek(St#st.fd, 0, seek_end),
             {reply, Error, St#st{eof = Eof}, ?MONITOR_CHECK}
-    end.
+    end;
+
+handle_call({decode, {Pos, Bin0}}, _From, St) ->
+    {ok, DEK} = get(dek),
+    Bin = aegis:block_decrypt(DEK, Pos, Bin0),
+    {reply, {ok, Bin}, St, ?MONITOR_CHECK}.
 
 
 handle_cast({update_read_timestamp, TS}, St) ->
@@ -403,14 +423,88 @@ init_st(FilePath, RawFd, Parent, Options) ->
             []
     end,
     {ok, Bytes} = nifile:seek(RawFd, 0, seek_end),
-    #st{
+    init_mode(#st{
         path = iolist_to_binary(FilePath),
         fd = RawFd,
         eof = Bytes,
         is_sys = lists:member(sys_db, Options),
         t2bopts = CompressOpts ++ [{minor_version, 1}],
         db_pid = Parent
-    }.
+    }, Options).
+
+
+init_mode(#st{path = FilePath} = St, Options) ->
+    case proplists:get_value(mode, Options, raw) of
+        aegis ->
+            case get_dek(FilePath, Options) of
+                {ok, DEK} ->
+                    put(dek, {ok, DEK}),
+                    {ok, St};
+                {error, Error} ->
+                    {error, Error}
+            end;
+        _ ->
+            {ok, St}
+    end.
+
+
+get_dek(FilePath, Options) ->
+    Creating = lists:member(create, Options),
+    KeyFile = key_file(FilePath),
+    case get_kek(Options) of
+        {ok, KEK} when Creating ->
+            write_key_file(KeyFile, KEK);
+        {ok, KEK} ->
+            read_key_file(KeyFile, KEK);
+        {error, Error} ->
+            {error, Error}
+    end.
+
+
+key_file(FilePath) ->
+    <<FilePath/binary, ".key">>.
+
+
+write_key_file(KeyFile, KEK) ->
+    KeyId = crypto:strong_rand_bytes(32),
+    KeyIdSize = byte_size(KeyId),
+    {ok, DEK} = aegis:make_dek(KeyId, KEK),
+    {ok, WrappedKey} = aegis:wrap_dek(KEK, DEK),
+    Bin = <<KeyIdSize:16, KeyId/binary, WrappedKey/binary>>,
+    ok = file:write_file(KeyFile, Bin, [exclusive]),
+    ok = set_read_only(KeyFile),
+    {ok, DEK}.
+
+
+set_read_only(Filename) ->
+    {ok, FileInfo} = file:read_file_info(Filename),
+    Mode0 = FileInfo#file_info.mode,
+    Mode1 = Mode0 band 8#00444,
+    file:write_file_info(Filename, FileInfo#file_info{mode = Mode1}).
+
+
+read_key_file(KeyFile, KEK) ->
+    case file:read_file(KeyFile) of
+        {ok, Bin} ->
+            <<KeyIdSize:16, KeyId:KeyIdSize/binary, WrappedKey/binary>> = Bin,
+            aegis:unwrap_dek(KEK, KeyId, WrappedKey);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+
+%% FIXME: this is a shim until we have KEK proxy in place
+get_kek(Options) ->
+    KeyId = key_id(Options),
+    Bin = crypto:hash(sha256, KeyId),
+    aegis:make_kek(KeyId, Bin).
+
+
+%% FIXME: this is a shim until we have `engine_options` opt handled in chttpd
+key_id(Options) ->
+    FakeKey = crypto:hash(sha256, "FakeKey"),
+    {EngineOptions} = proplists:get_value(engine_options, Options, {[]}),
+    proplists:get_value(<<"keyid">>, EngineOptions, FakeKey).
 
 
 maybe_track(Options) ->
@@ -443,27 +537,4 @@ is_idle(#st{}) ->
         {monitored_by, [Tracker]} -> true;
         {monitored_by, [_]} -> exit(tracker_monitoring_failed);
         _ -> false
-    end.
-
-
-hash(Bin, Name) ->
-    case Name of
-        adler32 -> hbin(erlang:adler32(Bin));
-        crc32 -> hbin(erlang:crc32(Bin));
-        phash2 -> hbin(erlang:phash2(Bin));
-        HashName -> crypto:hash(HashName, Bin)
-    end.
-
-
-hbin(Val) when is_integer(Val), Val >= 0, Val < 16#100000000 ->
-    <<Val:32/integer>>.
-
-
-verify(Bin) when is_binary(Bin), size(Bin) > 2 ->
-    <<NameSize:8, ValueSize:8, Rest/binary>> = Bin,
-    <<NameBin:NameSize/binary, Value:ValueSize/binary, Data/binary>> = Rest,
-    Name = list_to_atom(binary_to_list(NameBin)),
-    case hash(Data, Name) of
-        Value -> {ok, Data};
-        OtherValue -> {error, {hash_mismatch, Value, OtherValue}}
     end.

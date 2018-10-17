@@ -625,7 +625,7 @@ open_db_files(DirPath, Options) ->
         true -> filelib:ensure_dir(CPPath);
         false -> ok
     end,
-    case couch_ngen_file:open(CPPath, [raw | Options]) of
+    case couch_ngen_file:open(CPPath, [{mode, raw} | Options]) of
         {ok, Fd} ->
             open_idx_data_files(DirPath, Fd, Options);
         {error, enoent} ->
@@ -634,7 +634,7 @@ open_db_files(DirPath, Options) ->
             % moved the index and data files or else compaction
             % wasn't finished. Hence why we're not renaming them
             % here.
-            case couch_ngen_file:open(CPPath ++ ".compact", [raw]) of
+            case couch_ngen_file:open(CPPath ++ ".compact", [{mode, raw}]) of
                 {ok, Fd} ->
                     Fmt = "Recovering from compaction file: ~s~s",
                     couch_log:info(Fmt, [CPPath, ".compact"]),
@@ -651,10 +651,9 @@ open_db_files(DirPath, Options) ->
 
 open_idx_data_files(DirPath, CPFd, Options) ->
     % TODO: Grab this from the config
-    HashOpt = {hash, crc32},
     {ok, IdxPath, DataPath} = get_file_paths(DirPath, CPFd, Options),
-    {ok, IdxFd} = couch_ngen_file:open(IdxPath, [HashOpt | Options]),
-    {ok, DataFd} = couch_ngen_file:open(DataPath, [HashOpt | Options]),
+    {ok, IdxFd} = couch_ngen_file:open(IdxPath, [{mode, crc32} | Options]),
+    {ok, DataFd} = couch_ngen_file:open(DataPath, [{mode, aegis} | Options]),
     {ok, CPFd, IdxFd, DataFd}.
 
 

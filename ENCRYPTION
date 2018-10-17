@@ -1,0 +1,56 @@
+couch_ngen has built-in support for encryption
+
+Cryptography
+------------
+
+AES-GCM mode is used to protect all data at rest, this provides strong
+privacy _and_ strong authentication (protection from tampering).
+
+There is a two-level key hierarchy;
+
+Master Key
+
+This is a value (either 256-bit or 512-bit) stored outside of the
+system, but can be fetched at any time. Care is taken to protect these
+values from inspection while in memory and we recommend launching the
+erlang vm with the "+Mlpm all" to ensure that key data is not written
+to a swap partition or swap file.
+
+File Key
+
+Each encrypted couch_ngen file has its own independent key, generated
+securely on the node. This value is encrypted using AES-SIV (RFC 5297)
+and stored as the first bytes in the file. AES-SIV provides both
+privacy and authentication of the key data (GCM could have been used
+here but the requirement for a globally unique IV made SIV more
+attractive).
+
+Caching
+-------
+
+Caching is a vital component in this setup as we cannot afford to
+fetch the remote Master Key for every database operation.
+
+Master Keys are cached in a private ETS table inside
+couch_ngen_keycache. They are fetched on demand and the fethc method
+is pluggable (a Key Protect backend is included).
+
+File Keys are kept in the ngenfd record and in the server state of the
+couch_ngen.
+
+How To Use This
+---------------
+
+Supplying a key parameter when creating a couch_ngen database is all
+you need to do to enable this. The key should exist in the configured
+backend before doing so. The database creation will fail if it
+doesn't.
+
+curl foo:bar@host:5984/db1?engine=ngen&engine_options={"keyid":"ID"}
+
+The keyid parameter must be set to the name of the key that should
+protect the database contents. It is an arbitrary string.
+
+TODO - explicit confirmation that encryption was applied is needed, as
+is the ability to ask a database if it's encrypted, and which keyid it
+has. _obviously_ don't expose key bytes through http ever.
